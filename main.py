@@ -403,9 +403,23 @@ End with a new line containing exactly: <<<END>>>
     return text
 
 
+def _has_all_lab_sections(text: str) -> bool:
+    t = (text or "").upper()
+    required = [
+        "IMPRESSION:",
+        "KEY ABNORMALITIES:",
+        "WHAT THIS MAY SUGGEST:",
+        "WHAT TO CONFIRM:",
+        "NEXT STEPS:",
+        "LIMITATIONS:",
+    ]
+    return all(r in t for r in required)
+
+
 def gemini_lab_summary(extracted_text: str) -> str:
     """
-    LAB summary: text-based, ends with marker, auto-continues if truncated.
+    LAB summary: text-based, forces completeness.
+    Does NOT touch radiology prompts.
     """
     require_client()
     client = app.state.client
@@ -441,31 +455,36 @@ LIMITATIONS:
 • <1–4 bullets (single report, missing history, reference ranges vary).>
 
 IMPORTANT:
-- Do NOT stop mid-sentence or mid-bullet. Finish everything.
+- Do NOT stop mid-sentence or mid-bullet.
+- Always include ALL headings above.
 - End your response with a new line containing exactly: <<<END>>>
 
 LAB REPORT TEXT:
 {extracted_text[:14000]}
 """.strip()
 
+    # 1) First call
     try:
         resp = client.models.generate_content(
             model=model,
             contents=[{"role": "user", "parts": [{"text": base_prompt}]}],
-            config={"temperature": 0.2, "max_output_tokens": LAB_MAX_TOKENS},
+            # 5000 is fine; 3000 also works. Keep 5000 for “never cut”.
+            config={"temperature": 0.2, "max_output_tokens": 5000},
         )
     except Exception as e:
         clean_ai_error(e)
 
     text = (getattr(resp, "text", "") or "").strip()
 
+    # 2) Continue until END marker + headings exist
     tries = 0
-    while "<<<END>>>" not in text and tries < LAB_CONTINUE_MAX_TRIES:
+    while tries < 6 and (("<<<END>>>" not in text) or (not _has_all_lab_sections(text))):
         tries += 1
         cont_prompt = """
 Continue EXACTLY from where you left off.
 Do NOT repeat any previous lines.
-Finish any cut-off word/sentence and include any missing headings/lines.
+Finish any cut-off word/sentence.
+If any heading is missing, add it and fill it.
 End with a new line containing exactly: <<<END>>>
 """.strip()
 
@@ -477,7 +496,7 @@ End with a new line containing exactly: <<<END>>>
                     {"role": "model", "parts": [{"text": text}]},
                     {"role": "user", "parts": [{"text": cont_prompt}]},
                 ],
-                config={"temperature": 0.2, "max_output_tokens": LAB_MAX_TOKENS},
+                config={"temperature": 0.2, "max_output_tokens": 2000},
             )
         except Exception as e:
             clean_ai_error(e)
@@ -487,7 +506,34 @@ End with a new line containing exactly: <<<END>>>
             break
         text = (text + "\n" + text2).strip()
 
+    # 3) Last-resort “finish missing parts only” if still incomplete
+    if ("<<<END>>>" not in text) or (not _has_all_lab_sections(text)):
+        final_prompt = """
+You MUST complete the response.
+Do NOT repeat anything.
+Only add what is missing (finish the cut sentence and any missing headings/lines).
+End with a new line containing exactly: <<<END>>>
+""".strip()
+
+        try:
+            resp3 = client.models.generate_content(
+                model=model,
+                contents=[
+                    {"role": "user", "parts": [{"text": base_prompt}]},
+                    {"role": "model", "parts": [{"text": text}]},
+                    {"role": "user", "parts": [{"text": final_prompt}]},
+                ],
+                config={"temperature": 0.1, "max_output_tokens": 1500},
+            )
+            text3 = (getattr(resp3, "text", "") or "").strip()
+            if text3:
+                text = (text + "\n" + text3).strip()
+        except Exception as e:
+            clean_ai_error(e)
+
+    # strip marker
     text = text.replace("<<<END>>>", "").strip()
+
     if not text:
         raise RuntimeError("Gemini lab summary returned empty response.")
     return text
