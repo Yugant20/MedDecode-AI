@@ -18,7 +18,7 @@ import io
 # =========================
 # APP SETUP
 # =========================
-app = FastAPI(title="MedDecode AI", version="16.0")
+app = FastAPI(title="MedDecode AI", version="17.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,7 +55,7 @@ PASS1_MAX_TOKENS = 260
 PASS2_MAX_TOKENS = 5000
 LAB_MAX_TOKENS = 5000
 
-LAB_CONTINUE_MAX_TRIES = 4
+LAB_CONTINUE_MAX_TRIES = 6
 RAD_CONTINUE_MAX_TRIES = 3
 
 
@@ -74,7 +74,7 @@ def startup():
     # PowerShell: $env:GEMINI_MODEL="gemini-2.5-pro"
     app.state.model = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
-    # Render knobs
+    # Render knobs for radiology PDFs
     app.state.max_pages = int(os.getenv("MD_MAX_PAGES", "3"))
     app.state.render_zoom = float(os.getenv("MD_RENDER_ZOOM", "3.8"))
     app.state.max_total_images = int(os.getenv("MD_MAX_IMAGES", "10"))
@@ -133,7 +133,7 @@ def render_pdf_pages_to_png_bytes(pdf_path: str, max_pages: int, zoom: float) ->
     return out
 
 
-def extract_pdf_text(pdf_path: str, max_pages: int = 6) -> str:
+def extract_pdf_text(pdf_path: str, max_pages: int = 8) -> str:
     """
     Lab reports usually contain selectable text.
     If scanned image-only PDF, this may return empty (OCR would be needed).
@@ -149,22 +149,26 @@ def extract_pdf_text(pdf_path: str, max_pages: int = 6) -> str:
     return "\n\n".join(chunks).strip()
 
 
+# ✅ FIXED: strong LAB detection
 def detect_doc_type_from_text(extracted_text: str) -> str:
     """
     Returns: "lab" or "radiology"
-    Strong LAB detection so CBC/biochem PDFs do not go through radiology prompts.
+    Strong bias to LAB whenever we see lab keywords in extracted text.
     """
-    t = (extracted_text or "").lower()
+    t = (extracted_text or "").lower().strip()
+
+    # If there's basically no extracted text, it's probably image-only (often radiology scans)
+    if len(t) < 40:
+        return "radiology"
 
     lab_keywords = [
         "complete blood count", "cbc", "hemoglobin", "haemoglobin",
         "wbc", "rbc", "platelet", "plt", "hematocrit", "mcv", "mch", "mchc", "rdw",
         "neutrophil", "lymphocyte", "monocyte", "eosinophil", "basophil",
-        "reference range", "units", "result", "laboratory", "lab report", "pathology",
-        "peripheral smear", "anisocytosis", "poikilocytosis",
-        "serum", "ferritin", "iron", "tibc", "vitamin b12", "folate", "creatinine",
-        "sgot", "sgpt", "alt", "ast", "bilirubin", "glucose", "hba1c",
-        "reporting laboratory", "specimen", "method", "flag", "high", "low",
+        "reference range", "units", "pathology", "laboratory", "specimen", "method",
+        "anisocytosis", "poikilocytosis", "peripheral smear", "megathrombocyte",
+        "ferritin", "iron", "tibc", "creatinine", "alt", "ast", "bilirubin", "glucose", "hba1c",
+        "reporting laboratory", "result", "results", "flag", "high", "low",
     ]
 
     rad_keywords = [
@@ -176,11 +180,8 @@ def detect_doc_type_from_text(extracted_text: str) -> str:
     lab_hits = sum(1 for k in lab_keywords if k in t)
     rad_hits = sum(1 for k in rad_keywords if k in t)
 
-    # If there's meaningful extracted text and ANY lab signal with no rad signal => lab
-    if len(t) > 120 and lab_hits >= 1 and rad_hits == 0:
-        return "lab"
-
-    if lab_hits >= 2 and lab_hits >= rad_hits:
+    # Strong LAB bias: any lab signal in extracted text -> LAB (unless radiology is clearly stronger)
+    if lab_hits >= 1 and lab_hits >= rad_hits:
         return "lab"
 
     return "radiology"
@@ -249,13 +250,23 @@ def _has_all_radiology_sections(text: str) -> bool:
     return all(r in t for r in required)
 
 
+def _has_all_lab_sections(text: str) -> bool:
+    t = (text or "").upper()
+    required = [
+        "IMPRESSION:",
+        "KEY ABNORMALITIES:",
+        "WHAT THIS MAY SUGGEST:",
+        "WHAT TO CONFIRM:",
+        "NEXT STEPS:",
+        "LIMITATIONS:",
+    ]
+    return all(r in t for r in required)
+
+
 # =========================
-# GEMINI
+# GEMINI - RADIOLOGY (PROMPTS UNCHANGED)
 # =========================
 def gemini_pass_1_identify(all_images: List[bytes], page_count: int) -> str:
-    """
-    Pass 1: modality/anatomy/view/limits only (PROMPT UNCHANGED)
-    """
     require_client()
     client = app.state.client
     model = app.state.model
@@ -299,10 +310,6 @@ Limitations: ...
 
 
 def gemini_pass_2_radiology_report(all_images: List[bytes], context: str, page_count: int) -> str:
-    """
-    Pass 2: Radiology-style report. PROMPT TEXT UNCHANGED (only adds END marker line).
-    Auto-continues if truncated.
-    """
     require_client()
     client = app.state.client
     model = app.state.model
@@ -403,24 +410,10 @@ End with a new line containing exactly: <<<END>>>
     return text
 
 
-def _has_all_lab_sections(text: str) -> bool:
-    t = (text or "").upper()
-    required = [
-        "IMPRESSION:",
-        "KEY ABNORMALITIES:",
-        "WHAT THIS MAY SUGGEST:",
-        "WHAT TO CONFIRM:",
-        "NEXT STEPS:",
-        "LIMITATIONS:",
-    ]
-    return all(r in t for r in required)
-
-
+# =========================
+# GEMINI - LAB (FIXED: ALWAYS FULL)
+# =========================
 def gemini_lab_summary(extracted_text: str) -> str:
-    """
-    LAB summary: text-based, forces completeness.
-    Does NOT touch radiology prompts.
-    """
     require_client()
     client = app.state.client
     model = app.state.model
@@ -468,8 +461,7 @@ LAB REPORT TEXT:
         resp = client.models.generate_content(
             model=model,
             contents=[{"role": "user", "parts": [{"text": base_prompt}]}],
-            # 5000 is fine; 3000 also works. Keep 5000 for “never cut”.
-            config={"temperature": 0.2, "max_output_tokens": 5000},
+            config={"temperature": 0.2, "max_output_tokens": LAB_MAX_TOKENS},
         )
     except Exception as e:
         clean_ai_error(e)
@@ -478,7 +470,7 @@ LAB REPORT TEXT:
 
     # 2) Continue until END marker + headings exist
     tries = 0
-    while tries < 6 and (("<<<END>>>" not in text) or (not _has_all_lab_sections(text))):
+    while tries < LAB_CONTINUE_MAX_TRIES and (("<<<END>>>" not in text) or (not _has_all_lab_sections(text))):
         tries += 1
         cont_prompt = """
 Continue EXACTLY from where you left off.
@@ -506,11 +498,11 @@ End with a new line containing exactly: <<<END>>>
             break
         text = (text + "\n" + text2).strip()
 
-    # 3) Last-resort “finish missing parts only” if still incomplete
+    # 3) Last-resort completion if still incomplete
     if ("<<<END>>>" not in text) or (not _has_all_lab_sections(text)):
         final_prompt = """
 You MUST complete the response.
-Do NOT repeat anything.
+Do NOT repeat anything already written.
 Only add what is missing (finish the cut sentence and any missing headings/lines).
 End with a new line containing exactly: <<<END>>>
 """.strip()
@@ -531,7 +523,6 @@ End with a new line containing exactly: <<<END>>>
         except Exception as e:
             clean_ai_error(e)
 
-    # strip marker
     text = text.replace("<<<END>>>", "").strip()
 
     if not text:
@@ -555,7 +546,7 @@ def safety_guard_text(summary: str) -> str:
 
 
 # =========================
-# HOSPITAL STYLE PDF (LOGO + WATERMARK)
+# HOSPITAL STYLE PDF
 # =========================
 def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
     import re
@@ -568,11 +559,9 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
 
     path = os.path.join(OUT_DIR, f"{report_id}_summary.pdf")
 
-    # Clean markdown
     text = raw_text.replace("**", "").replace("\t", " ")
     text = re.sub(r"[ ]{2,}", " ", text)
 
-    # Extract generated timestamp if present
     generated = ""
     m = re.search(r"Generated:\s*([0-9T:\.\-Z]+)", text)
     if m:
@@ -620,7 +609,6 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
         bulletIndent=6,
     )
 
-    # Load logo
     logo_reader = None
     if os.path.exists(LOGO_PATH_PRIMARY):
         logo_reader = ImageReader(LOGO_PATH_PRIMARY)
@@ -634,7 +622,6 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
         w, h = letter
         canvas.saveState()
 
-        # WATERMARK
         canvas.saveState()
         canvas.setFillColor(colors.HexColor("#9CA3AF"))
         canvas.setFont("Helvetica-Bold", 60)
@@ -644,11 +631,9 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
         canvas.drawCentredString(0, 0, "CONFIDENTIAL")
         canvas.restoreState()
 
-        # TOP BAR
         canvas.setFillColor(colors.HexColor("#0B4F6C"))
         canvas.rect(0, h - 60, w, 60, fill=1, stroke=0)
 
-        # LOGO
         x0 = 36
         y0 = h - 52
         logo_size = 34
@@ -658,24 +643,20 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
             canvas.setFillColor(colors.white)
             canvas.roundRect(x0, y0, logo_size, logo_size, 6, fill=0, stroke=1)
 
-        # BRAND
         canvas.setFillColor(colors.white)
         canvas.setFont("Helvetica-Bold", 14)
         canvas.drawString(x0 + logo_size + 10, h - 34, "MedDecode AI")
         canvas.setFont("Helvetica", 10)
         canvas.drawString(x0 + logo_size + 10, h - 50, "Summary Report")
 
-        # PAGE
         canvas.setFillColor(colors.HexColor("#6B7280"))
         canvas.setFont("Helvetica", 9)
         canvas.drawRightString(w - 36, 26, f"Page {doc.page}")
 
-        # FOOTER LINE
         canvas.setStrokeColor(colors.HexColor("#E5E7EB"))
         canvas.setLineWidth(1)
         canvas.line(36, 40, w - 36, 40)
 
-        # DISCLAIMER
         canvas.setFillColor(colors.HexColor("#6B7280"))
         canvas.setFont("Helvetica", 8.5)
         canvas.drawCentredString(
@@ -721,7 +702,7 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
     story.append(meta_table)
     story.append(Spacer(1, 14))
 
-    # Render body preserving structure (handles "FINDINGS: • item" too)
+    # Handles "FINDINGS: • item" as well
     for ln in raw_text.splitlines():
         ln = ln.rstrip()
 
@@ -729,7 +710,6 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
             story.append(Spacer(1, 8))
             continue
 
-        # Inline bullet on same line as heading: "FINDINGS: • ..."
         if "•" in ln and not ln.lstrip().startswith("•"):
             before, after = ln.split("•", 1)
             before = before.strip()
@@ -787,9 +767,14 @@ def process(rid: str):
     try:
         page_count = get_pdf_page_count(pdf_path)
 
-        # Detect LAB vs RADIOLOGY from PDF TEXT first
-        extracted_text = extract_pdf_text(pdf_path, max_pages=6)
+        extracted_text = extract_pdf_text(pdf_path, max_pages=8)
         doc_type = detect_doc_type_from_text(extracted_text)
+
+        # ✅ SAFETY OVERRIDE: if text clearly looks like lab, force LAB no matter what
+        tlow = (extracted_text or "").lower()
+        force_lab_terms = ["cbc", "hemoglobin", "haemoglobin", "platelet", "wbc", "rbc", "mcv", "mch", "rdw", "reference range"]
+        if any(k in tlow for k in force_lab_terms):
+            doc_type = "lab"
 
         if doc_type == "lab":
             if not extracted_text:
