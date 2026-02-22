@@ -18,7 +18,7 @@ import io
 # =========================
 # APP SETUP
 # =========================
-app = FastAPI(title="MedDecode AI", version="15.0")
+app = FastAPI(title="MedDecode AI", version="15.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,6 +48,16 @@ os.makedirs(ASSETS_DIR, exist_ok=True)
 LOGO_PATH_PRIMARY = os.path.join(ASSETS_DIR, "logo.png")
 LOGO_PATH_FALLBACK = os.path.join(BASE_DIR, "logo.png")
 
+# =========================
+# TOKEN SETTINGS (SANE)
+# =========================
+# These values are intentionally "reasonable".
+# Models have hard limits; setting absurd values (like 50000) doesn't guarantee completeness.
+PASS1_MAX_TOKENS = 260
+PASS2_MAX_TOKENS = 2200
+LAB_MAX_TOKENS = 3200  # lab summaries can be longer
+LAB_CONTINUE_MAX_TRIES = 2  # try continuation up to 2 times
+
 
 # =========================
 # STARTUP
@@ -61,7 +71,6 @@ def startup():
         app.state.client = None
         print("⚠️ GEMINI_API_KEY is missing. /process will fail until you set it.")
 
-    # Use pro for best accuracy:
     # PowerShell: $env:GEMINI_MODEL="gemini-2.5-pro"
     app.state.model = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
@@ -165,7 +174,6 @@ def detect_doc_type_from_text(extracted_text: str) -> str:
     lab_hits = sum(1 for k in lab_keywords if k in t)
     rad_hits = sum(1 for k in rad_keywords if k in t)
 
-    # If we have strong lab signals, treat as lab
     if lab_hits >= 2 and lab_hits >= rad_hits:
         return "lab"
     return "radiology"
@@ -178,7 +186,6 @@ def clean_ai_error(e: Exception):
     msg = str(e)
     if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
         raise HTTPException(status_code=429, detail="AI limit reached. Please come back later.")
-    # Other errors
     raise HTTPException(status_code=500, detail="AI processing failed. Please try again later.")
 
 
@@ -202,22 +209,12 @@ def make_crops_from_page(png_bytes: bytes) -> List[bytes]:
 
     crops: List[Image.Image] = []
 
-    # Full image
     crops.append(img)
-
-    # Fingers area (top ~70%)
     crops.append(img.crop((0, 0, w, int(h * 0.72))))
-
-    # Central focus (phalanges/metacarpals)
     crops.append(img.crop((int(w * 0.10), int(h * 0.03), int(w * 0.90), int(h * 0.78))))
-
-    # Left finger region
     crops.append(img.crop((int(w * 0.03), int(h * 0.03), int(w * 0.58), int(h * 0.78))))
-
-    # Right finger region
     crops.append(img.crop((int(w * 0.42), int(h * 0.03), int(w * 0.97), int(h * 0.78))))
 
-    # Light upscale to help tiny details
     out_bytes: List[bytes] = []
     for c in crops:
         cw, ch = c.size
@@ -243,7 +240,7 @@ def _img_part_from_png(png_bytes: bytes) -> Dict[str, Any]:
 def gemini_pass_1_identify(all_images: List[bytes], page_count: int) -> str:
     """
     Pass 1: modality/anatomy/view/limits only (no diagnosis).
-    (UNCHANGED PROMPT)
+    (PROMPT UNCHANGED)
     """
     require_client()
     client = app.state.client
@@ -277,7 +274,7 @@ Limitations: ...
         resp = client.models.generate_content(
             model=model,
             contents=[{"role": "user", "parts": parts}],
-            config={"temperature": 0.1, "max_output_tokens": 50000},
+            config={"temperature": 0.1, "max_output_tokens": PASS1_MAX_TOKENS},
         )
     except Exception as e:
         clean_ai_error(e)
@@ -290,7 +287,7 @@ Limitations: ...
 def gemini_pass_2_radiology_report(all_images: List[bytes], context: str, page_count: int) -> str:
     """
     Pass 2: Radiology-style report, possible diagnosis, not definitive.
-    (PROMPT UNCHANGED as requested)
+    (PROMPT UNCHANGED AS REQUESTED)
     """
     require_client()
     client = app.state.client
@@ -346,8 +343,7 @@ RULES:
         resp = client.models.generate_content(
             model=model,
             contents=[{"role": "user", "parts": parts}],
-            # NOTE: prompt unchanged; only output tokens can be higher to avoid cut-off
-            config={"temperature": 0.2, "max_output_tokens": 50000},
+            config={"temperature": 0.2, "max_output_tokens": PASS2_MAX_TOKENS},
         )
     except Exception as e:
         clean_ai_error(e)
@@ -359,13 +355,13 @@ RULES:
 
 def gemini_lab_summary(extracted_text: str) -> str:
     """
-    LAB summary: uses PDF text (CBC/biochem/etc).
+    LAB summary: uses PDF text and auto-continues if truncated.
     """
     require_client()
     client = app.state.client
     model = app.state.model
 
-    prompt = f"""
+    base_prompt = f"""
 You are a clinical lab report summarizer.
 
 Input: Text from a lab report (CBC/biochem panels).
@@ -394,28 +390,64 @@ NEXT STEPS:
 LIMITATIONS:
 • <1–4 bullets (single report, missing history, reference ranges vary).>
 
+IMPORTANT:
+- Do NOT stop mid-sentence or mid-bullet. Finish everything.
+- End your response with a new line containing exactly: <<<END>>>
+
 LAB REPORT TEXT:
 {extracted_text[:14000]}
 """.strip()
 
+    # 1st response
     try:
         resp = client.models.generate_content(
             model=model,
-            contents=[{"role": "user", "parts": [{"text": prompt}]}],
-            config={"temperature": 0.2, "max_output_tokens": 50000},
+            contents=[{"role": "user", "parts": [{"text": base_prompt}]}],
+            config={"temperature": 0.2, "max_output_tokens": LAB_MAX_TOKENS},
         )
     except Exception as e:
         clean_ai_error(e)
 
-    if not getattr(resp, "text", None):
+    text = (getattr(resp, "text", "") or "").strip()
+
+    # Continue until END marker or max tries
+    tries = 0
+    while "<<<END>>>" not in text and tries < LAB_CONTINUE_MAX_TRIES:
+        tries += 1
+        cont_prompt = """
+Continue EXACTLY from where you left off.
+Do NOT repeat any previous lines.
+Finish any cut-off word/sentence and include any missing headings/lines.
+End with a new line containing exactly: <<<END>>>
+""".strip()
+
+        try:
+            resp2 = client.models.generate_content(
+                model=model,
+                contents=[
+                    {"role": "user", "parts": [{"text": base_prompt}]},
+                    {"role": "model", "parts": [{"text": text}]},
+                    {"role": "user", "parts": [{"text": cont_prompt}]},
+                ],
+                config={"temperature": 0.2, "max_output_tokens": LAB_MAX_TOKENS},
+            )
+        except Exception as e:
+            clean_ai_error(e)
+
+        text2 = (getattr(resp2, "text", "") or "").strip()
+        if text2:
+            text = (text + "\n" + text2).strip()
+        else:
+            break
+
+    text = text.replace("<<<END>>>", "").strip()
+
+    if not text:
         raise RuntimeError("Gemini lab summary returned empty response.")
-    return resp.text.strip()
+    return text
 
 
 def safety_guard_text(summary: str) -> str:
-    """
-    Remove dangerous absolute claims but keep useful 'possible diagnosis' text.
-    """
     s = summary
     replacements = [
         ("No fracture", "No obvious displaced fracture seen; an occult/non-displaced fracture cannot be excluded"),
@@ -598,7 +630,7 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
     story.append(meta_table)
     story.append(Spacer(1, 14))
 
-    # Render body preserving structure
+    # Render body preserving structure (handles "FINDINGS: • item" too)
     for ln in raw_text.splitlines():
         ln = ln.rstrip()
 
@@ -606,12 +638,28 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
             story.append(Spacer(1, 8))
             continue
 
+        # Inline bullet on same line as heading: "FINDINGS: • ..."
+        if "•" in ln and not ln.lstrip().startswith("•"):
+            before, after = ln.split("•", 1)
+            before = before.strip()
+            after = after.strip()
+            if before:
+                story.append(Paragraph(before, body_style))
+            if after:
+                story.append(Paragraph(after, bullet_style, bulletText="•"))
+            continue
+
         stripped = ln.lstrip()
+
         if stripped.startswith(("•", "-", "*")):
             clean = stripped[1:].strip()
-            story.append(Paragraph(clean, bullet_style, bulletText="•"))
-        else:
-            story.append(Paragraph(ln, body_style))
+            if clean:
+                story.append(Paragraph(clean, bullet_style, bulletText="•"))
+            else:
+                story.append(Spacer(1, 4))
+            continue
+
+        story.append(Paragraph(ln, body_style))
 
     doc.build(story, onFirstPage=draw_header_footer, onLaterPages=draw_header_footer)
     return path
@@ -649,11 +697,11 @@ def process(rid: str):
     try:
         page_count = get_pdf_page_count(pdf_path)
 
-        # 1) Detect LAB vs RADIOLOGY from PDF TEXT first (so lab reports never go into radiology prompts)
+        # Detect LAB vs RADIOLOGY from PDF TEXT first
         extracted_text = extract_pdf_text(pdf_path, max_pages=6)
         doc_type = detect_doc_type_from_text(extracted_text)
 
-        # 2) LAB FLOW (text-based)
+        # LAB FLOW (text-based)
         if doc_type == "lab":
             if not extracted_text:
                 raise HTTPException(
@@ -661,22 +709,22 @@ def process(rid: str):
                     detail="This looks like a lab report, but text could not be extracted (likely scanned). Upload a text-based PDF (selectable text).",
                 )
             summary = gemini_lab_summary(extracted_text)
+            images_sent = 0
 
-        # 3) RADIOLOGY FLOW (image-based) — prompts unchanged
+        # RADIOLOGY FLOW (image-based) — prompts unchanged
         else:
-            # Render pages
             pages_png = render_pdf_pages_to_png_bytes(
                 pdf_path,
                 max_pages=app.state.max_pages,
                 zoom=app.state.render_zoom,
             )
 
-            # Full + crops for each page
             all_images: List[bytes] = []
             for p in pages_png:
                 all_images.extend(make_crops_from_page(p))
 
             all_images = all_images[: app.state.max_total_images]
+            images_sent = len(all_images)
 
             context = gemini_pass_1_identify(all_images, page_count)
             summary = gemini_pass_2_radiology_report(all_images, context, page_count)
@@ -685,11 +733,9 @@ def process(rid: str):
     except HTTPException:
         raise
     except Exception as e:
-        # Keep server logs detailed, but return clean message to client
         print("=== PROCESS ERROR ===")
         print(f"{type(e).__name__}: {e}")
         traceback.print_exc()
-        # If it's quota/rate, keep it short
         msg = str(e)
         if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
             raise HTTPException(status_code=429, detail="AI limit reached. Please come back later.")
@@ -708,7 +754,8 @@ Generated: {now_iso()}
     REPORTS[rid]["pdf"] = pdf_out
     REPORTS[rid]["page_count"] = page_count
     REPORTS[rid]["model"] = app.state.model
-    REPORTS[rid]["doc_type"] = detect_doc_type_from_text(extract_pdf_text(pdf_path, max_pages=2))
+    REPORTS[rid]["doc_type"] = doc_type
+    REPORTS[rid]["images_sent"] = images_sent
 
     return {
         "report_id": rid,
@@ -716,7 +763,8 @@ Generated: {now_iso()}
         "pdf_url": f"/pdf/{rid}",
         "page_count_in_pdf": page_count,
         "model": app.state.model,
-        "doc_type": REPORTS[rid]["doc_type"],
+        "doc_type": doc_type,
+        "images_sent": images_sent,
     }
 
 
