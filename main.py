@@ -74,7 +74,7 @@ def startup():
     # LLM knobs
     app.state.max_retries_429 = int(os.getenv("MD_GEMINI_MAX_RETRIES_429", "2"))
     app.state.max_output_pass1 = int(os.getenv("MD_GEMINI_MAX_OUT_PASS1", "320"))
-    app.state.max_output_pass2 = int(os.getenv("MD_GEMINI_MAX_OUT_PASS2", "2200"))  # higher = less truncation
+    app.state.max_output_pass2 = int(os.getenv("MD_GEMINI_MAX_OUT_PASS2", "50000"))  # higher = less truncation
     app.state.temperature_pass1 = float(os.getenv("MD_GEMINI_TEMP_PASS1", "0.1"))
     app.state.temperature_pass2 = float(os.getenv("MD_GEMINI_TEMP_PASS2", "0.2"))
 
