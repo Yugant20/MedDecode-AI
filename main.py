@@ -22,7 +22,10 @@ app = FastAPI(title="MedDecode AI", version="14.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # dev only
+    allow_origins=[
+        "http://localhost:5173",
+        "https://yugant20.github.io",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
