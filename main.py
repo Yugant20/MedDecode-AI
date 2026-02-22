@@ -2,8 +2,10 @@ import os
 import uuid
 import base64
 import traceback
+import time
+import re
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +20,7 @@ import io
 # =========================
 # APP SETUP
 # =========================
-app = FastAPI(title="MedDecode AI", version="14.0")
+app = FastAPI(title="MedDecode AI", version="15.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,14 +63,20 @@ def startup():
         app.state.client = None
         print("⚠️ GEMINI_API_KEY is missing. /process will fail until you set it.")
 
-    # Use pro for best accuracy:
     # PowerShell: $env:GEMINI_MODEL="gemini-2.5-pro"
     app.state.model = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
     # Render knobs
     app.state.max_pages = int(os.getenv("MD_MAX_PAGES", "3"))
-    app.state.render_zoom = float(os.getenv("MD_RENDER_ZOOM", "3.8"))  # higher = better fracture detail
-    app.state.max_total_images = int(os.getenv("MD_MAX_IMAGES", "10"))  # allow more crops
+    app.state.render_zoom = float(os.getenv("MD_RENDER_ZOOM", "3.8"))
+    app.state.max_total_images = int(os.getenv("MD_MAX_IMAGES", "10"))
+
+    # LLM knobs
+    app.state.max_retries_429 = int(os.getenv("MD_GEMINI_MAX_RETRIES_429", "2"))
+    app.state.max_output_pass1 = int(os.getenv("MD_GEMINI_MAX_OUT_PASS1", "320"))
+    app.state.max_output_pass2 = int(os.getenv("MD_GEMINI_MAX_OUT_PASS2", "2200"))  # higher = less truncation
+    app.state.temperature_pass1 = float(os.getenv("MD_GEMINI_TEMP_PASS1", "0.1"))
+    app.state.temperature_pass2 = float(os.getenv("MD_GEMINI_TEMP_PASS2", "0.2"))
 
     if os.path.exists(LOGO_PATH_PRIMARY):
         print(f"✅ Logo found: {LOGO_PATH_PRIMARY}")
@@ -91,17 +99,13 @@ def require_client():
     if not getattr(app.state, "client", None):
         raise HTTPException(
             status_code=500,
-            detail=(
-                "GEMINI_API_KEY not set.\n"
-                "Set it in Windows Environment Variables (User variables) and restart VS Code/terminal."
-            ),
+            detail="Server not configured (missing AI key). Please try again later.",
         )
 
 
 def save_upload(file: UploadFile, report_id: str) -> str:
     if file.content_type != "application/pdf" and (file.filename and not file.filename.lower().endswith(".pdf")):
         raise HTTPException(400, "Please upload a PDF file.")
-
     path = os.path.join(UPLOAD_DIR, f"{report_id}.pdf")
     with open(path, "wb") as f:
         f.write(file.file.read())
@@ -182,6 +186,88 @@ def _img_part_from_png(png_bytes: bytes) -> Dict[str, Any]:
     }
 
 
+def _extract_retry_seconds(err_text: str) -> int:
+    """
+    Tries to parse Gemini retry hints like:
+    - "Please retry in 47.82s."
+    - "retryDelay': '47s'"
+    Defaults to 60s.
+    """
+    m = re.search(r"retry in ([0-9]+(\.[0-9]+)?)s", err_text, re.IGNORECASE)
+    if m:
+        return int(float(m.group(1))) + 1
+    m2 = re.search(r"retryDelay['\"]:\s*['\"](\d+)s['\"]", err_text)
+    if m2:
+        return int(m2.group(1)) + 1
+    return 60
+
+
+def _raise_clean_ai_error(e: Exception):
+    """
+    Converts Gemini errors into clean HTTP errors (no giant trace messages).
+    """
+    msg = str(e)
+
+    # Rate limit / quota
+    if ("RESOURCE_EXHAUSTED" in msg) or ("429" in msg):
+        raise HTTPException(status_code=429, detail="AI limit reached. Please come back later.")
+
+    # Other AI errors
+    raise HTTPException(status_code=500, detail="AI processing failed. Please try again later.")
+
+
+def _gemini_generate_with_429_retry(*, client, model: str, contents: List[Dict[str, Any]], config: Dict[str, Any]):
+    """
+    Calls Gemini with small retry on 429/quota. If still failing, returns clean message.
+    """
+    max_retries = int(getattr(app.state, "max_retries_429", 2))
+    last_err: Optional[Exception] = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            return client.models.generate_content(model=model, contents=contents, config=config)
+        except Exception as e:
+            last_err = e
+            txt = str(e)
+            if ("RESOURCE_EXHAUSTED" in txt) or ("429" in txt):
+                if attempt == max_retries:
+                    _raise_clean_ai_error(e)
+                time.sleep(_extract_retry_seconds(txt))
+                continue
+            _raise_clean_ai_error(e)
+
+    # Should never reach
+    if last_err:
+        _raise_clean_ai_error(last_err)
+    raise HTTPException(status_code=500, detail="AI processing failed. Please try again later.")
+
+
+def _safe_resp_text(resp) -> str:
+    """
+    More robust extraction than resp.text in case SDK returns different shapes.
+    """
+    if getattr(resp, "text", None):
+        t = resp.text.strip()
+        if t:
+            return t
+
+    # Try candidates structure
+    try:
+        cands = getattr(resp, "candidates", None)
+        if cands and len(cands) > 0:
+            content = getattr(cands[0], "content", None)
+            parts = getattr(content, "parts", None) if content else None
+            if parts and len(parts) > 0:
+                txt = getattr(parts[0], "text", "") or ""
+                txt = txt.strip()
+                if txt:
+                    return txt
+    except Exception:
+        pass
+
+    raise RuntimeError("AI returned empty response.")
+
+
 # =========================
 # GEMINI
 # =========================
@@ -212,19 +298,18 @@ Body part/anatomy: ...
 Laterality: left/right/uncertain
 View/plane: ...
 Limitations: ...
-"""
+""".strip()
 
     parts = [_img_part_from_png(p) for p in all_images[: app.state.max_total_images]]
     parts.append({"text": prompt})
 
-    resp = client.models.generate_content(
+    resp = _gemini_generate_with_429_retry(
+        client=client,
         model=model,
         contents=[{"role": "user", "parts": parts}],
-        config={"temperature": 0.1, "max_output_tokens": 260},
+        config={"temperature": app.state.temperature_pass1, "max_output_tokens": app.state.max_output_pass1},
     )
-    if not getattr(resp, "text", None):
-        raise RuntimeError("Gemini pass-1 returned empty response.")
-    return resp.text.strip()
+    return _safe_resp_text(resp)
 
 
 def gemini_pass_2_radiology_report(all_images: List[bytes], context: str, page_count: int) -> str:
@@ -257,38 +342,41 @@ IMPRESSION:
 Confidence: <Low / Medium / High>
 
 FINDINGS:
-• <3–8 bullets describing visible signs: fracture line, cortical disruption, angulation, alignment, joint involvement, swelling>
+• <3–10 bullets describing visible signs: fracture line, cortical disruption, angulation, alignment, joint involvement, swelling>
 
 WHAT THIS MEANS:
-<2–5 short lines for a patient>
+<2–6 short lines for a patient>
 
 LIMITATIONS:
-• <1–3 bullets: single view, image quality, no history, subtle fractures>
+• <1–4 bullets: single view, image quality, no history, subtle fractures>
 
 RECOMMENDED NEXT STEP:
-• <2–5 bullets: additional views (AP/lateral/oblique), radiology read, ortho/ER if severe pain/deformity, immobilization guidance>
+• <2–6 bullets: additional views (AP/lateral/oblique), radiology read, ortho/ER if severe pain/deformity, immobilization guidance>
 
-RULES:
+STRICT RULES:
+- Do NOT stop mid-sentence or mid-bullet. Finish every bullet completely.
 - If you see fracture cues (lucent line, cortical break, step-off, angulation, displaced fragment), state:
   "Suspected/possible fracture at <finger + bone + segment>".
 - NEVER say "no fracture" or "fracture ruled out".
   If not obvious, say: "No obvious displaced fracture; occult/non-displaced fracture cannot be excluded."
 - Do NOT invent patient age/history/symptoms.
 - If laterality is unclear, say "laterality uncertain".
-- If you provide fewer than 10 lines, you failed. Always include all sections.
-"""
+- Always include ALL headings and at least 18 total lines of content.
+""".strip()
 
     parts = [_img_part_from_png(p) for p in all_images[: app.state.max_total_images]]
     parts.append({"text": prompt})
 
-    resp = client.models.generate_content(
+    resp = _gemini_generate_with_429_retry(
+        client=client,
         model=model,
         contents=[{"role": "user", "parts": parts}],
-        config={"temperature": 0.2, "max_output_tokens": 1200},
+        config={
+            "temperature": app.state.temperature_pass2,
+            "max_output_tokens": app.state.max_output_pass2,  # important: prevents truncation
+        },
     )
-    if not getattr(resp, "text", None):
-        raise RuntimeError("Gemini pass-2 returned empty response.")
-    return resp.text.strip()
+    return _safe_resp_text(resp)
 
 
 def safety_guard_text(summary: str) -> str:
@@ -313,7 +401,7 @@ def safety_guard_text(summary: str) -> str:
 # HOSPITAL STYLE PDF (LOGO + WATERMARK)
 # =========================
 def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
-    import re
+    import re as _re
     from reportlab.lib.pagesizes import letter
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -326,11 +414,11 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
     # Clean markdown
     text = raw_text.replace("**", "")
     text = text.replace("\t", " ")
-    text = re.sub(r"[ ]{2,}", " ", text)
+    text = _re.sub(r"[ ]{2,}", " ", text)
 
     # Extract generated timestamp if present
     generated = ""
-    m = re.search(r"Generated:\s*([0-9T:\.\-Z]+)", text)
+    m = _re.search(r"Generated:\s*([0-9T:\.\-Z]+)", text)
     if m:
         generated = m.group(1)
 
@@ -458,10 +546,18 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
     story.append(Spacer(1, 10))
 
     meta_data = [
-        [Paragraph("Report ID:", label_style), Paragraph(report_id, subtle_style),
-         Paragraph("Generated (UTC):", label_style), Paragraph(generated or "—", subtle_style)],
-        [Paragraph("Filename:", label_style), Paragraph(filename or "—", subtle_style),
-         Paragraph("Reviewer:", label_style), Paragraph("MedDecode AI (Automated)", subtle_style)],
+        [
+            Paragraph("Report ID:", label_style),
+            Paragraph(report_id, subtle_style),
+            Paragraph("Generated (UTC):", label_style),
+            Paragraph(generated or "—", subtle_style),
+        ],
+        [
+            Paragraph("Filename:", label_style),
+            Paragraph(filename or "—", subtle_style),
+            Paragraph("Reviewer:", label_style),
+            Paragraph("MedDecode AI (Automated)", subtle_style),
+        ],
     ]
     meta_table = Table(meta_data, colWidths=[80, 200, 105, 135])
     meta_table.setStyle(TableStyle([
@@ -547,15 +643,14 @@ def process(rid: str):
         summary = safety_guard_text(summary)
 
     except HTTPException:
+        # This includes our clean 429 message: "AI limit reached. Please come back later."
         raise
     except Exception as e:
+        # Keep server logs detailed, but return clean message to client
         print("=== PROCESS ERROR ===")
         print(f"{type(e).__name__}: {e}")
         traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Processing failed: {type(e).__name__}: {str(e)}",
-        )
+        raise HTTPException(status_code=500, detail="Processing failed. Please try again later.")
 
     final_text = f"""Report ID: {rid}
 Filename: {filename}
