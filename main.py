@@ -149,7 +149,7 @@ def extract_pdf_text(pdf_path: str, max_pages: int = 8) -> str:
     return "\n\n".join(chunks).strip()
 
 
-# ✅ FIXED: strong LAB detection
+# strong LAB detection
 def detect_doc_type_from_text(extracted_text: str) -> str:
     """
     Returns: "lab" or "radiology"
@@ -418,65 +418,77 @@ def gemini_lab_summary(extracted_text: str) -> str:
     client = app.state.client
     model = app.state.model
 
+    # Reduce prompt bloat (biggest reason for truncation)
+    lab_text = (extracted_text or "").strip()
+    lab_text = lab_text[:7000]  # was 14000
+
     base_prompt = f"""
-You are a clinical lab report summarizer.
+You are a clinical LAB report summarizer.
 
-Input: Text from a lab report (CBC/biochem panels).
-Goal: Produce a patient-friendly but clinically useful summary.
-Do NOT refuse. Do NOT say you cannot generate.
-Do NOT invent values that are not present.
-If values/ranges are missing, say "not shown".
+Input: text from a lab report (CBC/biochem).
+Goal: produce a patient-friendly but clinically useful summary.
 
-OUTPUT FORMAT (exact headings):
+STRICT RULES:
+- Do NOT invent values not present.
+- If values/ranges are missing, write "not shown".
+- Do NOT use the heading "FINDINGS" (radiology-only).
+- Use ONLY the headings listed below, exactly and in this order.
+- Do NOT stop mid-sentence or mid-bullet.
+- End with a new line containing exactly: <<<END>>>
+
+OUTPUT FORMAT (exact headings, in this exact order):
 
 IMPRESSION:
-<1–3 lines: overall pattern (use "possible/suggestive", not definitive).>
+<1–3 lines. Overall pattern (possible/suggestive, not definitive).>
 
 KEY ABNORMALITIES:
-• <3–12 bullets: each bullet should include test name + value + unit + flag if present, otherwise say "not shown".>
+• <3–12 bullets. Each bullet: test name + value + unit + flag if present; otherwise "not shown".>
 
 WHAT THIS MAY SUGGEST:
 <2–6 short lines (not definitive).>
 
 WHAT TO CONFIRM:
-• <2–6 bullets (e.g., ferritin/iron studies, repeat CBC, peripheral smear, etc.)>
+• <2–6 bullets>
 
 NEXT STEPS:
-• <2–6 bullets (follow-up and urgency guidance).>
+• <2–6 bullets>
 
 LIMITATIONS:
-• <1–4 bullets (single report, missing history, reference ranges vary).>
-
-IMPORTANT:
-- Do NOT stop mid-sentence or mid-bullet.
-- Always include ALL headings above.
-- End your response with a new line containing exactly: <<<END>>>
+• <1–4 bullets>
 
 LAB REPORT TEXT:
-{extracted_text[:14000]}
+{lab_text}
 """.strip()
 
-    # 1) First call
     try:
         resp = client.models.generate_content(
             model=model,
             contents=[{"role": "user", "parts": [{"text": base_prompt}]}],
-            config={"temperature": 0.2, "max_output_tokens": LAB_MAX_TOKENS},
+            config={"temperature": 0.2, "max_output_tokens": 2000},
         )
     except Exception as e:
         clean_ai_error(e)
 
     text = (getattr(resp, "text", "") or "").strip()
 
-    # 2) Continue until END marker + headings exist
+    # Continue WITHOUT re-sending the full lab report text (critical)
     tries = 0
     while tries < LAB_CONTINUE_MAX_TRIES and (("<<<END>>>" not in text) or (not _has_all_lab_sections(text))):
         tries += 1
         cont_prompt = """
 Continue EXACTLY from where you left off.
 Do NOT repeat any previous lines.
-Finish any cut-off word/sentence.
-If any heading is missing, add it and fill it.
+Do NOT introduce the heading "FINDINGS".
+If any required heading is missing, add it and fill it.
+
+Required headings (must all exist):
+IMPRESSION:
+KEY ABNORMALITIES:
+WHAT THIS MAY SUGGEST:
+WHAT TO CONFIRM:
+NEXT STEPS:
+LIMITATIONS:
+
 End with a new line containing exactly: <<<END>>>
 """.strip()
 
@@ -484,11 +496,10 @@ End with a new line containing exactly: <<<END>>>
             resp2 = client.models.generate_content(
                 model=model,
                 contents=[
-                    {"role": "user", "parts": [{"text": base_prompt}]},
                     {"role": "model", "parts": [{"text": text}]},
                     {"role": "user", "parts": [{"text": cont_prompt}]},
                 ],
-                config={"temperature": 0.2, "max_output_tokens": 2000},
+                config={"temperature": 0.2, "max_output_tokens": 1200},
             )
         except Exception as e:
             clean_ai_error(e)
@@ -498,32 +509,34 @@ End with a new line containing exactly: <<<END>>>
             break
         text = (text + "\n" + text2).strip()
 
-    # 3) Last-resort completion if still incomplete
+    # Hard repair: rewrite if still incomplete
     if ("<<<END>>>" not in text) or (not _has_all_lab_sections(text)):
-        final_prompt = """
-You MUST complete the response.
-Do NOT repeat anything already written.
-Only add what is missing (finish the cut sentence and any missing headings/lines).
-End with a new line containing exactly: <<<END>>>
+        repair_prompt = """
+Rewrite the summary from scratch using ONLY the required headings in the required order.
+Do NOT use the heading "FINDINGS".
+Keep it concise but complete.
+End with <<<END>>>.
 """.strip()
 
         try:
             resp3 = client.models.generate_content(
                 model=model,
                 contents=[
-                    {"role": "user", "parts": [{"text": base_prompt}]},
-                    {"role": "model", "parts": [{"text": text}]},
-                    {"role": "user", "parts": [{"text": final_prompt}]},
+                    {"role": "user", "parts": [{"text": repair_prompt}]},
+                    {"role": "user", "parts": [{"text": "LAB REPORT TEXT:\n" + lab_text}]},
                 ],
-                config={"temperature": 0.1, "max_output_tokens": 1500},
+                config={"temperature": 0.1, "max_output_tokens": 2000},
             )
             text3 = (getattr(resp3, "text", "") or "").strip()
             if text3:
-                text = (text + "\n" + text3).strip()
+                text = text3.strip()
         except Exception as e:
             clean_ai_error(e)
 
     text = text.replace("<<<END>>>", "").strip()
+
+    # Safety: if model leaks FINDINGS, normalize it
+    text = text.replace("FINDINGS:", "KEY ABNORMALITIES:")
 
     if not text:
         raise RuntimeError("Gemini lab summary returned empty response.")
