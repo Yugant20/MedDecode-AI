@@ -63,7 +63,7 @@ def startup():
 
     # Use pro for best accuracy:
     # PowerShell: $env:GEMINI_MODEL="gemini-2.5-pro"
-    app.state.model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    app.state.model = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
     # Render knobs
     app.state.max_pages = int(os.getenv("MD_MAX_PAGES", "3"))
