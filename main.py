@@ -18,7 +18,7 @@ import io
 # =========================
 # APP SETUP
 # =========================
-app = FastAPI(title="MedDecode AI", version="15.1")
+app = FastAPI(title="MedDecode AI", version="15.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,12 +51,13 @@ LOGO_PATH_FALLBACK = os.path.join(BASE_DIR, "logo.png")
 # =========================
 # TOKEN SETTINGS (SANE)
 # =========================
-# These values are intentionally "reasonable".
-# Models have hard limits; setting absurd values (like 50000) doesn't guarantee completeness.
 PASS1_MAX_TOKENS = 260
 PASS2_MAX_TOKENS = 2200
-LAB_MAX_TOKENS = 3200  # lab summaries can be longer
-LAB_CONTINUE_MAX_TRIES = 2  # try continuation up to 2 times
+LAB_MAX_TOKENS = 3200
+
+# continuation tries
+LAB_CONTINUE_MAX_TRIES = 2
+RAD_CONTINUE_MAX_TRIES = 2
 
 
 # =========================
@@ -71,13 +72,12 @@ def startup():
         app.state.client = None
         print("⚠️ GEMINI_API_KEY is missing. /process will fail until you set it.")
 
-    # PowerShell: $env:GEMINI_MODEL="gemini-2.5-pro"
     app.state.model = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
     # Render knobs
     app.state.max_pages = int(os.getenv("MD_MAX_PAGES", "3"))
-    app.state.render_zoom = float(os.getenv("MD_RENDER_ZOOM", "3.8"))  # higher = better fracture detail
-    app.state.max_total_images = int(os.getenv("MD_MAX_IMAGES", "10"))  # allow more crops
+    app.state.render_zoom = float(os.getenv("MD_RENDER_ZOOM", "3.8"))
+    app.state.max_total_images = int(os.getenv("MD_MAX_IMAGES", "10"))
 
     if os.path.exists(LOGO_PATH_PRIMARY):
         print(f"✅ Logo found: {LOGO_PATH_PRIMARY}")
@@ -134,10 +134,6 @@ def render_pdf_pages_to_png_bytes(pdf_path: str, max_pages: int, zoom: float) ->
 
 
 def extract_pdf_text(pdf_path: str, max_pages: int = 6) -> str:
-    """
-    Lab reports usually contain selectable text.
-    If scanned image-only PDF, this may return empty (OCR would be needed).
-    """
     doc = fitz.open(pdf_path)
     pages = min(doc.page_count, max_pages)
     chunks: List[str] = []
@@ -152,15 +148,19 @@ def extract_pdf_text(pdf_path: str, max_pages: int = 6) -> str:
 def detect_doc_type_from_text(extracted_text: str) -> str:
     """
     Returns: "lab" or "radiology"
-    Uses ONLY PDF text so radiology prompts remain unchanged and lab PDFs won't go through radiology flow.
+
+    Stronger LAB detection so CBC reports never go into radiology prompts.
     """
     t = (extracted_text or "").lower()
 
+    # If we extracted a decent amount of text and it has classic CBC tokens -> lab
+    # (Even 1-2 hits is enough, because radiology PDFs rarely contain these.)
     lab_keywords = [
         "complete blood count", "cbc", "hemoglobin", "haemoglobin",
         "wbc", "rbc", "platelet", "plt", "hematocrit", "mcv", "mch", "mchc", "rdw",
         "neutrophil", "lymphocyte", "monocyte", "eosinophil", "basophil",
         "reference range", "units", "result", "laboratory", "lab report", "pathology",
+        "peripheral smear", "anisocytosis", "poikilocytosis",
         "serum", "ferritin", "iron", "tibc", "vitamin b12", "folate", "creatinine",
         "sgot", "sgpt", "alt", "ast", "bilirubin", "glucose", "hba1c",
     ]
@@ -174,15 +174,18 @@ def detect_doc_type_from_text(extracted_text: str) -> str:
     lab_hits = sum(1 for k in lab_keywords if k in t)
     rad_hits = sum(1 for k in rad_keywords if k in t)
 
+    # If there's meaningful extracted text and any strong lab signal -> LAB
+    if len(t) > 120 and lab_hits >= 1 and rad_hits == 0:
+        return "lab"
+
+    # Original logic as fallback
     if lab_hits >= 2 and lab_hits >= rad_hits:
         return "lab"
+
     return "radiology"
 
 
 def clean_ai_error(e: Exception):
-    """
-    Convert Gemini quota/rate errors into a short user message.
-    """
     msg = str(e)
     if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
         raise HTTPException(status_code=429, detail="AI limit reached. Please come back later.")
@@ -200,15 +203,10 @@ def pil_to_png_bytes(img: Image.Image) -> bytes:
 
 
 def make_crops_from_page(png_bytes: bytes) -> List[bytes]:
-    """
-    For hand X-rays, the fracture is often subtle.
-    We send the full image + several zoomed crops so Gemini can see cortex lines.
-    """
     img = png_bytes_to_pil(png_bytes)
     w, h = img.size
 
     crops: List[Image.Image] = []
-
     crops.append(img)
     crops.append(img.crop((0, 0, w, int(h * 0.72))))
     crops.append(img.crop((int(w * 0.10), int(h * 0.03), int(w * 0.90), int(h * 0.78))))
@@ -234,14 +232,27 @@ def _img_part_from_png(png_bytes: bytes) -> Dict[str, Any]:
     }
 
 
+def _has_all_radiology_sections(text: str) -> bool:
+    """
+    Heuristic: radiology output should contain all headings.
+    (Does not change radiology prompt.)
+    """
+    t = (text or "").upper()
+    required = [
+        "IMPRESSION:",
+        "CONFIDENCE:",
+        "FINDINGS:",
+        "WHAT THIS MEANS:",
+        "LIMITATIONS:",
+        "RECOMMENDED NEXT STEP:",
+    ]
+    return all(r in t for r in required)
+
+
 # =========================
 # GEMINI
 # =========================
 def gemini_pass_1_identify(all_images: List[bytes], page_count: int) -> str:
-    """
-    Pass 1: modality/anatomy/view/limits only (no diagnosis).
-    (PROMPT UNCHANGED)
-    """
     require_client()
     client = app.state.client
     model = app.state.model
@@ -286,8 +297,8 @@ Limitations: ...
 
 def gemini_pass_2_radiology_report(all_images: List[bytes], context: str, page_count: int) -> str:
     """
-    Pass 2: Radiology-style report, possible diagnosis, not definitive.
-    (PROMPT UNCHANGED AS REQUESTED)
+    PROMPT TEXT UNCHANGED.
+    Adds auto-continue WITHOUT altering the prompt content.
     """
     require_client()
     client = app.state.client
@@ -339,6 +350,7 @@ RULES:
     parts = [_img_part_from_png(p) for p in all_images[: app.state.max_total_images]]
     parts.append({"text": prompt})
 
+    # First call
     try:
         resp = client.models.generate_content(
             model=model,
@@ -348,15 +360,43 @@ RULES:
     except Exception as e:
         clean_ai_error(e)
 
-    if not getattr(resp, "text", None):
+    text = (getattr(resp, "text", "") or "").strip()
+    if not text:
         raise RuntimeError("Gemini pass-2 returned empty response.")
-    return resp.text.strip()
+
+    # Continuation if truncated (missing sections or ends mid-thought)
+    tries = 0
+    while tries < RAD_CONTINUE_MAX_TRIES and not _has_all_radiology_sections(text):
+        tries += 1
+        cont_prompt = """
+Continue EXACTLY from where you left off.
+Do NOT repeat any previous lines.
+Only add the missing remainder so that ALL required headings exist:
+IMPRESSION, Confidence, FINDINGS, WHAT THIS MEANS, LIMITATIONS, RECOMMENDED NEXT STEP.
+""".strip()
+
+        try:
+            resp2 = client.models.generate_content(
+                model=model,
+                contents=[
+                    {"role": "user", "parts": parts},
+                    {"role": "model", "parts": [{"text": text}]},
+                    {"role": "user", "parts": [{"text": cont_prompt}]},
+                ],
+                config={"temperature": 0.2, "max_output_tokens": PASS2_MAX_TOKENS},
+            )
+        except Exception as e:
+            clean_ai_error(e)
+
+        text2 = (getattr(resp2, "text", "") or "").strip()
+        if not text2:
+            break
+        text = (text + "\n" + text2).strip()
+
+    return text
 
 
 def gemini_lab_summary(extracted_text: str) -> str:
-    """
-    LAB summary: uses PDF text and auto-continues if truncated.
-    """
     require_client()
     client = app.state.client
     model = app.state.model
@@ -398,7 +438,6 @@ LAB REPORT TEXT:
 {extracted_text[:14000]}
 """.strip()
 
-    # 1st response
     try:
         resp = client.models.generate_content(
             model=model,
@@ -410,7 +449,6 @@ LAB REPORT TEXT:
 
     text = (getattr(resp, "text", "") or "").strip()
 
-    # Continue until END marker or max tries
     tries = 0
     while "<<<END>>>" not in text and tries < LAB_CONTINUE_MAX_TRIES:
         tries += 1
@@ -435,10 +473,9 @@ End with a new line containing exactly: <<<END>>>
             clean_ai_error(e)
 
         text2 = (getattr(resp2, "text", "") or "").strip()
-        if text2:
-            text = (text + "\n" + text2).strip()
-        else:
+        if not text2:
             break
+        text = (text + "\n" + text2).strip()
 
     text = text.replace("<<<END>>>", "").strip()
 
@@ -476,12 +513,10 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
 
     path = os.path.join(OUT_DIR, f"{report_id}_summary.pdf")
 
-    # Clean markdown
     text = raw_text.replace("**", "")
     text = text.replace("\t", " ")
     text = re.sub(r"[ ]{2,}", " ", text)
 
-    # Extract generated timestamp if present
     generated = ""
     m = re.search(r"Generated:\s*([0-9T:\.\-Z]+)", text)
     if m:
@@ -529,7 +564,6 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
         bulletIndent=6,
     )
 
-    # Load logo
     logo_reader = None
     if os.path.exists(LOGO_PATH_PRIMARY):
         logo_reader = ImageReader(LOGO_PATH_PRIMARY)
@@ -543,7 +577,6 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
         w, h = letter
         canvas.saveState()
 
-        # WATERMARK
         canvas.saveState()
         canvas.setFillColor(colors.HexColor("#9CA3AF"))
         canvas.setFont("Helvetica-Bold", 60)
@@ -553,11 +586,9 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
         canvas.drawCentredString(0, 0, "CONFIDENTIAL")
         canvas.restoreState()
 
-        # TOP BAR
         canvas.setFillColor(colors.HexColor("#0B4F6C"))
         canvas.rect(0, h - 60, w, 60, fill=1, stroke=0)
 
-        # LOGO
         x0 = 36
         y0 = h - 52
         logo_size = 34
@@ -567,24 +598,20 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
             canvas.setFillColor(colors.white)
             canvas.roundRect(x0, y0, logo_size, logo_size, 6, fill=0, stroke=1)
 
-        # BRAND
         canvas.setFillColor(colors.white)
         canvas.setFont("Helvetica-Bold", 14)
         canvas.drawString(x0 + logo_size + 10, h - 34, "MedDecode AI")
         canvas.setFont("Helvetica", 10)
         canvas.drawString(x0 + logo_size + 10, h - 50, "Summary Report")
 
-        # PAGE
         canvas.setFillColor(colors.HexColor("#6B7280"))
         canvas.setFont("Helvetica", 9)
         canvas.drawRightString(w - 36, 26, f"Page {doc.page}")
 
-        # FOOTER LINE
         canvas.setStrokeColor(colors.HexColor("#E5E7EB"))
         canvas.setLineWidth(1)
         canvas.line(36, 40, w - 36, 40)
 
-        # DISCLAIMER
         canvas.setFillColor(colors.HexColor("#6B7280"))
         canvas.setFont("Helvetica", 8.5)
         canvas.drawCentredString(
@@ -630,7 +657,7 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
     story.append(meta_table)
     story.append(Spacer(1, 14))
 
-    # Render body preserving structure (handles "FINDINGS: • item" too)
+    # Better bullet handling
     for ln in raw_text.splitlines():
         ln = ln.rstrip()
 
@@ -638,7 +665,6 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
             story.append(Spacer(1, 8))
             continue
 
-        # Inline bullet on same line as heading: "FINDINGS: • ..."
         if "•" in ln and not ln.lstrip().startswith("•"):
             before, after = ln.split("•", 1)
             before = before.strip()
@@ -650,7 +676,6 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
             continue
 
         stripped = ln.lstrip()
-
         if stripped.startswith(("•", "-", "*")):
             clean = stripped[1:].strip()
             if clean:
@@ -697,11 +722,9 @@ def process(rid: str):
     try:
         page_count = get_pdf_page_count(pdf_path)
 
-        # Detect LAB vs RADIOLOGY from PDF TEXT first
         extracted_text = extract_pdf_text(pdf_path, max_pages=6)
         doc_type = detect_doc_type_from_text(extracted_text)
 
-        # LAB FLOW (text-based)
         if doc_type == "lab":
             if not extracted_text:
                 raise HTTPException(
@@ -711,7 +734,6 @@ def process(rid: str):
             summary = gemini_lab_summary(extracted_text)
             images_sent = 0
 
-        # RADIOLOGY FLOW (image-based) — prompts unchanged
         else:
             pages_png = render_pdf_pages_to_png_bytes(
                 pdf_path,
