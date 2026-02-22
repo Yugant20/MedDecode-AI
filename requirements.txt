@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+supabase
+PyJWT
+requests
+pypdf
+reportlab
+openai
