@@ -52,8 +52,8 @@ LOGO_PATH_FALLBACK = os.path.join(BASE_DIR, "logo.png")
 # TOKEN SETTINGS (SANE)
 # =========================
 PASS1_MAX_TOKENS = 260
-PASS2_MAX_TOKENS = 2200
-LAB_MAX_TOKENS = 3200
+PASS2_MAX_TOKENS = 5000
+LAB_MAX_TOKENS = 6000
 
 # continuation tries
 LAB_CONTINUE_MAX_TRIES = 2
@@ -297,8 +297,8 @@ Limitations: ...
 
 def gemini_pass_2_radiology_report(all_images: List[bytes], context: str, page_count: int) -> str:
     """
-    PROMPT TEXT UNCHANGED.
-    Adds auto-continue WITHOUT altering the prompt content.
+    Pass 2: Radiology-style report, possible diagnosis, not definitive.
+    PROMPT IS NOT CHANGED except adding a required END marker line at the very end.
     """
     require_client()
     client = app.state.client
@@ -345,7 +345,9 @@ RULES:
 - Do NOT invent patient age/history/symptoms.
 - If laterality is unclear, say "laterality uncertain".
 - If you provide fewer than 10 lines, you failed. Always include all sections.
-"""
+
+End your response with a new line containing exactly: <<<END>>>
+""".strip()
 
     parts = [_img_part_from_png(p) for p in all_images[: app.state.max_total_images]]
     parts.append({"text": prompt})
@@ -361,18 +363,16 @@ RULES:
         clean_ai_error(e)
 
     text = (getattr(resp, "text", "") or "").strip()
-    if not text:
-        raise RuntimeError("Gemini pass-2 returned empty response.")
 
-    # Continuation if truncated (missing sections or ends mid-thought)
+    # Continue up to 2 times if truncated
     tries = 0
-    while tries < RAD_CONTINUE_MAX_TRIES and not _has_all_radiology_sections(text):
+    while "<<<END>>>" not in text and tries < 2:
         tries += 1
         cont_prompt = """
 Continue EXACTLY from where you left off.
-Do NOT repeat any previous lines.
-Only add the missing remainder so that ALL required headings exist:
-IMPRESSION, Confidence, FINDINGS, WHAT THIS MEANS, LIMITATIONS, RECOMMENDED NEXT STEP.
+Do NOT repeat anything already written.
+Finish any cut-off word/sentence.
+End with a new line containing exactly: <<<END>>>
 """.strip()
 
         try:
@@ -393,6 +393,11 @@ IMPRESSION, Confidence, FINDINGS, WHAT THIS MEANS, LIMITATIONS, RECOMMENDED NEXT
             break
         text = (text + "\n" + text2).strip()
 
+    # Remove END marker
+    text = text.replace("<<<END>>>", "").strip()
+
+    if not text:
+        raise RuntimeError("Gemini pass-2 returned empty response.")
     return text
 
 
