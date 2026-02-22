@@ -277,7 +277,7 @@ Limitations: ...
         resp = client.models.generate_content(
             model=model,
             contents=[{"role": "user", "parts": parts}],
-            config={"temperature": 0.1, "max_output_tokens": 260},
+            config={"temperature": 0.1, "max_output_tokens": 50000},
         )
     except Exception as e:
         clean_ai_error(e)
@@ -347,7 +347,7 @@ RULES:
             model=model,
             contents=[{"role": "user", "parts": parts}],
             # NOTE: prompt unchanged; only output tokens can be higher to avoid cut-off
-            config={"temperature": 0.2, "max_output_tokens": 2200},
+            config={"temperature": 0.2, "max_output_tokens": 50000},
         )
     except Exception as e:
         clean_ai_error(e)
@@ -402,7 +402,7 @@ LAB REPORT TEXT:
         resp = client.models.generate_content(
             model=model,
             contents=[{"role": "user", "parts": [{"text": prompt}]}],
-            config={"temperature": 0.2, "max_output_tokens": 2200},
+            config={"temperature": 0.2, "max_output_tokens": 50000},
         )
     except Exception as e:
         clean_ai_error(e)
