@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import base64
 import traceback
@@ -18,7 +19,7 @@ import io
 # =========================
 # APP SETUP
 # =========================
-app = FastAPI(title="MedDecode AI", version="19.0")
+app = FastAPI(title="MedDecode AI", version="20.0-LABFIX-REGEX")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,19 +50,17 @@ LOGO_PATH_PRIMARY = os.path.join(ASSETS_DIR, "logo.png")
 LOGO_PATH_FALLBACK = os.path.join(BASE_DIR, "logo.png")
 
 # =========================
-# TOKEN SETTINGS (ROBUST)
+# TOKEN SETTINGS
 # =========================
 PASS1_MAX_TOKENS = 260
 PASS2_MAX_TOKENS = 5000
 
-# LAB: smaller outputs are more reliable (avoid truncation)
+# LAB: smaller is more reliable than huge outputs
 LAB_MAX_TOKENS = 2000
+LAB_TEXT_SLICE = 7000
 
 LAB_CONTINUE_MAX_TRIES = 6
 RAD_CONTINUE_MAX_TRIES = 3
-
-# Lab text slice to reduce prompt bloat
-LAB_TEXT_SLICE = 7000
 
 
 # =========================
@@ -167,24 +166,25 @@ def detect_doc_type_from_text(extracted_text: str) -> str:
 
     lab_keywords = [
         "complete blood count", "cbc", "hemoglobin", "haemoglobin",
-        "wbc", "rbc", "platelet", "plt", "hematocrit", "mcv", "mch", "mchc", "rdw",
-        "neutrophil", "lymphocyte", "monocyte", "eosinophil", "basophil",
-        "reference range", "units", "pathology", "laboratory", "specimen", "method",
-        "anisocytosis", "poikilocytosis", "peripheral smear", "megathrombocyte",
-        "ferritin", "iron", "tibc", "creatinine", "alt", "ast", "bilirubin", "glucose", "hba1c",
-        "result", "results", "flag", "high", "low",
+        "wbc", "rbc", "platelet", "plt", "hematocrit", "haematocrit",
+        "mcv", "mch", "mchc", "rdw", "neutrophil", "lymphocyte",
+        "monocyte", "eosinophil", "basophil", "reference range", "units",
+        "pathology", "laboratory", "specimen", "method",
+        "anisocytosis", "poikilocytosis", "peripheral smear",
+        "ferritin", "iron", "tibc", "creatinine", "alt", "ast", "bilirubin",
+        "glucose", "hba1c", "result", "results", "flag", "high", "low",
     ]
 
     rad_keywords = [
         "x-ray", "xray", "radiograph", "ct", "mri", "ultrasound",
         "ap view", "pa view", "lateral", "oblique", "fracture", "dislocation",
-        "cortical", "joint space", "soft tissue swelling",
+        "nodule", "spiculated", "lymphadenopathy", "mediastinal", "hilar",
+        "impression", "findings",
     ]
 
     lab_hits = sum(1 for k in lab_keywords if k in t)
     rad_hits = sum(1 for k in rad_keywords if k in t)
 
-    # Strong LAB bias
     if lab_hits >= 1 and lab_hits >= rad_hits:
         return "lab"
     return "radiology"
@@ -240,21 +240,64 @@ def _img_part_from_png(png_bytes: bytes) -> Dict[str, Any]:
     }
 
 
+# =========================
+# SECTION CHECKS (REGEX, tolerant to line breaks)
+# =========================
 def _has_all_radiology_sections(text: str) -> bool:
-    t = (text or "").upper()
-    required = [
-        "IMPRESSION:",
-        "CONFIDENCE:",
-        "FINDINGS:",
-        "WHAT THIS MEANS:",
-        "LIMITATIONS:",
-        "RECOMMENDED NEXT STEP:",
+    t = (text or "")
+    patterns = [
+        r"IMPRESSION\s*:",
+        r"CONFIDENCE\s*:",
+        r"FINDINGS\s*:",
+        r"WHAT\s+THIS\s+MEANS\s*:",
+        r"LIMITATIONS\s*:",
+        r"RECOMMENDED\s+NEXT\s+STEP\s*:",
     ]
-    return all(r in t for r in required)
+    return all(re.search(p, t, flags=re.IGNORECASE) for p in patterns)
 
 
 def _has_all_lab_sections(text: str) -> bool:
-    t = (text or "").upper()
+    t = (text or "")
+    patterns = [
+        r"IMPRESSION\s*:",
+        r"KEY\s+ABNORMALITIES\s*:",
+        r"WHAT\s+THIS\s+MAY\s+SUGGEST\s*:",
+        r"WHAT\s+TO\s+CONFIRM\s*:",
+        r"NEXT\s+STEPS\s*:",
+        r"LIMITATIONS\s*:",
+    ]
+    return all(re.search(p, t, flags=re.IGNORECASE) for p in patterns)
+
+
+# =========================
+# FINALIZERS (GUARANTEE NON-EMPTY, NEVER "STOPS")
+# =========================
+def finalize_lab_summary(text: str) -> str:
+    """
+    Guarantees a LAB summary is complete enough for PDF even if the model truncates.
+    - normalizes accidental headings
+    - ensures all required headings exist
+    - ensures headings have content (safe placeholders)
+    """
+    t = (text or "").strip()
+    if not t:
+        return (
+            "IMPRESSION:\nNot shown.\n\n"
+            "KEY ABNORMALITIES:\n• Not shown.\n\n"
+            "WHAT THIS MAY SUGGEST:\nNot shown.\n\n"
+            "WHAT TO CONFIRM:\n• Not shown.\n\n"
+            "NEXT STEPS:\n• Not shown.\n\n"
+            "LIMITATIONS:\n• Not shown.\n"
+        ).strip()
+
+    # Normalize "FINDINGS" -> lab section
+    t = re.sub(r"\bFINDINGS\s*:", "KEY ABNORMALITIES:", t, flags=re.IGNORECASE)
+
+    # If it ends mid-word, add ellipsis + newline
+    if t and t[-1].isalnum():
+        t += "…\n"
+
+    # Ensure required headings exist (append missing with safe placeholders)
     required = [
         "IMPRESSION:",
         "KEY ABNORMALITIES:",
@@ -263,52 +306,74 @@ def _has_all_lab_sections(text: str) -> bool:
         "NEXT STEPS:",
         "LIMITATIONS:",
     ]
-    return all(r in t for r in required)
+
+    def has_heading(h: str) -> bool:
+        # tolerate line breaks/spaces
+        hh = h.replace(":", "").strip()
+        pattern = r"\b" + r"\s+".join(map(re.escape, hh.split())) + r"\s*:"
+        return bool(re.search(pattern, t, flags=re.IGNORECASE))
+
+    for h in required:
+        if not has_heading(h):
+            if h == "IMPRESSION:":
+                t += "\n\nIMPRESSION:\nNot shown (output truncated)."
+            elif h == "KEY ABNORMALITIES:":
+                t += "\n\nKEY ABNORMALITIES:\n• Not shown (output truncated before listing values)."
+            elif h == "WHAT THIS MAY SUGGEST:":
+                t += "\n\nWHAT THIS MAY SUGGEST:\nNot shown (output truncated)."
+            elif h == "WHAT TO CONFIRM:":
+                t += "\n\nWHAT TO CONFIRM:\n• Not shown (output truncated)."
+            elif h == "NEXT STEPS:":
+                t += "\n\nNEXT STEPS:\n• Not shown (output truncated)."
+            elif h == "LIMITATIONS:":
+                t += (
+                    "\n\nLIMITATIONS:\n"
+                    "• Output may be incomplete due to model truncation.\n"
+                    "• Confirm using the original report and a clinician.\n"
+                    "• Reference ranges vary by lab."
+                )
+
+    # Ensure each heading has at least some content
+    lines = t.splitlines()
+    out: List[str] = []
+    heading_patterns = [
+        r"^\s*IMPRESSION\s*:\s*$",
+        r"^\s*KEY\s+ABNORMALITIES\s*:\s*$",
+        r"^\s*WHAT\s+THIS\s+MAY\s+SUGGEST\s*:\s*$",
+        r"^\s*WHAT\s+TO\s+CONFIRM\s*:\s*$",
+        r"^\s*NEXT\s+STEPS\s*:\s*$",
+        r"^\s*LIMITATIONS\s*:\s*$",
+    ]
+
+    def is_heading_line(line: str) -> bool:
+        return any(re.match(p, line, flags=re.IGNORECASE) for p in heading_patterns)
+
+    i = 0
+    while i < len(lines):
+        out.append(lines[i])
+        if is_heading_line(lines[i]):
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j >= len(lines) or is_heading_line(lines[j]):
+                # no content after heading
+                if re.match(r"^\s*KEY\s+ABNORMALITIES\s*:", lines[i], flags=re.IGNORECASE):
+                    out.append("• Not shown (output truncated).")
+                else:
+                    out.append("Not shown (output truncated).")
+        i += 1
+
+    return "\n".join(out).strip()
 
 
-def ensure_lab_complete(text: str) -> str:
+def finalize_radiology_summary(text: str) -> str:
     """
-    Guarantees all required LAB headings exist.
-    If Gemini truncates, append missing sections with safe placeholders.
-    This prevents PDFs from ending mid-summary.
+    Light safeguard: ensure the radiology output doesn't end mid-word.
     """
     t = (text or "").strip()
-    upper = t.upper()
-
-    required_order = [
-        "IMPRESSION:",
-        "KEY ABNORMALITIES:",
-        "WHAT THIS MAY SUGGEST:",
-        "WHAT TO CONFIRM:",
-        "NEXT STEPS:",
-        "LIMITATIONS:",
-    ]
-    missing = [h for h in required_order if h not in upper]
-    if not missing:
-        return t
-
-    # If it ended mid-word, add newline
-    if t and not t.endswith((".", "!", "?", ":", "•")):
-        t += "\n"
-
-    blocks: List[str] = []
-    if "KEY ABNORMALITIES:" in missing:
-        blocks.append("KEY ABNORMALITIES:\n• Not shown (model output truncated before listing values).")
-    if "WHAT THIS MAY SUGGEST:" in missing:
-        blocks.append("WHAT THIS MAY SUGGEST:\nNot shown (model output truncated).")
-    if "WHAT TO CONFIRM:" in missing:
-        blocks.append("WHAT TO CONFIRM:\n• Not shown (model output truncated).")
-    if "NEXT STEPS:" in missing:
-        blocks.append("NEXT STEPS:\n• Not shown (model output truncated).")
-    if "LIMITATIONS:" in missing:
-        blocks.append(
-            "LIMITATIONS:\n"
-            "• Output truncated; verify using the original lab report.\n"
-            "• Reference ranges vary by lab.\n"
-            "• Clinical correlation required."
-        )
-
-    return (t + "\n\n" + "\n\n".join(blocks)).strip()
+    if t and t[-1].isalnum():
+        t += "…"
+    return t
 
 
 # =========================
@@ -402,7 +467,7 @@ RULES:
   If not obvious, say: "No obvious displaced fracture; occult/non-displaced fracture cannot be excluded."
 - Do NOT invent patient age/history/symptoms.
 - If laterality is unclear, say "laterality uncertain".
-- If you provide fewer than 10 lines, you failed. Always include all sections.
+- Always include all sections.
 
 End your response with a new line containing exactly: <<<END>>>
 """.strip()
@@ -454,11 +519,11 @@ End with <<<END>>> on its own line.
     text = text.replace("<<<END>>>", "").strip()
     if not text:
         raise RuntimeError("Gemini pass-2 returned empty response.")
-    return text
+    return finalize_radiology_summary(text)
 
 
 # =========================
-# GEMINI - LAB (TEXT) - FIXED
+# GEMINI - LAB (TEXT)
 # =========================
 def gemini_lab_summary(extracted_text: str) -> str:
     require_client()
@@ -479,6 +544,7 @@ STRICT RULES:
 - Do NOT use the heading "FINDINGS" (radiology-only).
 - Use ONLY the headings listed below, exactly and in this order.
 - Do NOT stop mid-sentence or mid-bullet.
+- If the document looks like IMAGING (CT/X-ray/MRI, nodule, lymph nodes), say so in LIMITATIONS and do NOT invent lab values.
 - End with a new line containing exactly: <<<END>>>
 
 OUTPUT FORMAT (exact headings, in this exact order):
@@ -516,7 +582,7 @@ LAB REPORT TEXT:
 
     text = (getattr(resp, "text", "") or "").strip()
 
-    # Continue WITHOUT re-sending the big lab report text (critical)
+    # Continue WITHOUT re-sending the big lab text (critical)
     tries = 0
     while tries < LAB_CONTINUE_MAX_TRIES and (("<<<END>>>" not in text) or (not _has_all_lab_sections(text))):
         tries += 1
@@ -525,15 +591,6 @@ Continue EXACTLY from where you left off.
 Do NOT repeat any previous lines.
 Do NOT introduce the heading "FINDINGS".
 If any required heading is missing, add it and fill it.
-
-Required headings (must all exist):
-IMPRESSION:
-KEY ABNORMALITIES:
-WHAT THIS MAY SUGGEST:
-WHAT TO CONFIRM:
-NEXT STEPS:
-LIMITATIONS:
-
 End with a new line containing exactly: <<<END>>>
 """.strip()
 
@@ -554,7 +611,7 @@ End with a new line containing exactly: <<<END>>>
             break
         text = (text + "\n" + text2).strip()
 
-    # Hard repair: rewrite if still incomplete
+    # If still incomplete, rewrite from scratch (still using small lab_text)
     if ("<<<END>>>" not in text) or (not _has_all_lab_sections(text)):
         repair_prompt = """
 Rewrite the summary from scratch using ONLY the required headings in the required order.
@@ -579,16 +636,11 @@ End with <<<END>>>.
             clean_ai_error(e)
 
     text = text.replace("<<<END>>>", "").strip()
-    text = text.replace("FINDINGS:", "KEY ABNORMALITIES:")
-    text = ensure_lab_complete(text)
-
-    if not text:
-        raise RuntimeError("Gemini lab summary returned empty response.")
-    return text
+    return finalize_lab_summary(text)
 
 
 # =========================
-# GEMINI - LAB (IMAGE FALLBACK for scanned PDFs) - FIXED
+# GEMINI - LAB (IMAGE FALLBACK for scanned PDFs)
 # =========================
 def gemini_lab_summary_from_images(all_images: List[bytes]) -> str:
     require_client()
@@ -607,6 +659,7 @@ STRICT RULES:
 - Do NOT use the heading "FINDINGS" (radiology-only).
 - Use ONLY the headings listed below, exactly and in this order.
 - Do NOT stop mid-sentence or mid-bullet.
+- If the document looks like IMAGING (CT/X-ray/MRI, nodule, lymph nodes), say so in LIMITATIONS and do NOT invent lab values.
 - End your response with a new line containing exactly: <<<END>>>
 
 OUTPUT FORMAT (exact headings, in this exact order):
@@ -672,7 +725,6 @@ End with a new line containing exactly: <<<END>>>
             break
         text = (text + "\n" + text2).strip()
 
-    # Hard repair for image path too
     if ("<<<END>>>" not in text) or (not _has_all_lab_sections(text)):
         repair_prompt = """
 Rewrite the summary from scratch using ONLY the required headings in the required order.
@@ -697,12 +749,7 @@ End with <<<END>>>.
             clean_ai_error(e)
 
     text = text.replace("<<<END>>>", "").strip()
-    text = text.replace("FINDINGS:", "KEY ABNORMALITIES:")
-    text = ensure_lab_complete(text)
-
-    if not text:
-        raise RuntimeError("Gemini lab (image) summary returned empty response.")
-    return text
+    return finalize_lab_summary(text)
 
 
 def safety_guard_text(summary: str) -> str:
@@ -724,7 +771,7 @@ def safety_guard_text(summary: str) -> str:
 # HOSPITAL STYLE PDF
 # =========================
 def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
-    import re
+    import re as _re
     from reportlab.lib.pagesizes import letter
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -735,10 +782,10 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
     path = os.path.join(OUT_DIR, f"{report_id}_summary.pdf")
 
     text = raw_text.replace("**", "").replace("\t", " ")
-    text = re.sub(r"[ ]{2,}", " ", text)
+    text = _re.sub(r"[ ]{2,}", " ", text)
 
     generated = ""
-    m = re.search(r"Generated:\s*([0-9T:\.\-Z]+)", text)
+    m = _re.search(r"Generated:\s*([0-9T:\.\-Z]+)", text)
     if m:
         generated = m.group(1)
 
@@ -880,7 +927,7 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
     story.append(meta_table)
     story.append(Spacer(1, 14))
 
-    # Handles "FINDINGS: • item" too
+    # Render lines with bullet support
     for ln in raw_text.splitlines():
         ln = ln.rstrip()
 
@@ -922,6 +969,7 @@ def health():
         "status": "ok",
         "model": getattr(app.state, "model", None),
         "has_key": bool(getattr(app.state, "client", None)),
+        "app_version": app.version,
     }
 
 
@@ -948,7 +996,7 @@ def process(rid: str):
         extracted_text = extract_pdf_text(pdf_path, max_pages=8)
         doc_type = detect_doc_type_from_text(extracted_text)
 
-        # If it smells like lab, FORCE LAB
+        # Force LAB if clear lab terms exist
         tlow = (extracted_text or "").lower()
         force_lab_terms = [
             "cbc", "hemoglobin", "haemoglobin", "platelet", "wbc", "rbc",
@@ -968,19 +1016,28 @@ def process(rid: str):
                 images_sent = 0
             else:
                 # scanned/image-only lab -> summarize from images
-                pages_png = render_pdf_pages_to_png_bytes(
-                    pdf_path,
-                    max_pages=3,
-                    zoom=3.2,
-                )
+                pages_png = render_pdf_pages_to_png_bytes(pdf_path, max_pages=3, zoom=3.2)
                 all_images = pages_png[: app.state.max_total_images]
                 images_sent = len(all_images)
                 summary = gemini_lab_summary_from_images(all_images)
 
+            # If model produced imaging-style content, reroute to radiology
+            imaging_red_flags = [
+                "ct", "x-ray", "xray", "mri", "ultrasound",
+                "nodule", "spiculated", "lymphadenopathy", "mediastinal", "hilar",
+                "pet/ct", "ebus", "biopsy", "carcinoma", "metast", "staging"
+            ]
+            s_low = (summary or "").lower()
+            if any(k in s_low for k in imaging_red_flags):
+                doc_type = "radiology"
+            else:
+                # Guarantee non-stopping lab output (even if truncation)
+                summary = finalize_lab_summary(summary)
+
         # =====================
         # RADIOLOGY FLOW
         # =====================
-        else:
+        if doc_type == "radiology":
             pages_png = render_pdf_pages_to_png_bytes(
                 pdf_path,
                 max_pages=app.state.max_pages,
@@ -997,6 +1054,7 @@ def process(rid: str):
             context = gemini_pass_1_identify(all_images, page_count)
             summary = gemini_pass_2_radiology_report(all_images, context, page_count)
             summary = safety_guard_text(summary)
+            summary = finalize_radiology_summary(summary)
 
     except HTTPException:
         raise
@@ -1035,6 +1093,7 @@ Generated: {now_iso()}
         "doc_type": doc_type,
         "images_sent": images_sent,
         "summary_len": REPORTS[rid]["summary_len"],
+        "app_version": app.version,
     }
 
 
