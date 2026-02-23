@@ -19,7 +19,7 @@ from PIL import Image
 # =========================
 # APP SETUP
 # =========================
-app = FastAPI(title="MedDecode AI", version="25.0-LAB-NO-EMPTY-TEXT")
+app = FastAPI(title="MedDecode AI", version="26.0-LAB-ROBUST-JSON-FALLBACK")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,9 +55,9 @@ LOGO_PATH_FALLBACK = os.path.join(BASE_DIR, "logo.png")
 PASS1_MAX_TOKENS = 260
 PASS2_MAX_TOKENS = 5000
 
-LAB_JSON_MAX_TOKENS = 1800
-LAB_SUMMARY_MAX_TOKENS = 2600
-LAB_TEXT_SLICE = 12000
+LAB_JSON_MAX_TOKENS = 1400
+LAB_SUMMARY_MAX_TOKENS = 1800
+LAB_TEXT_SLICE = 9000
 
 LAB_CONTINUE_MAX_TRIES = 8
 RAD_CONTINUE_MAX_TRIES = 3
@@ -79,6 +79,7 @@ def startup():
 
     app.state.model = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
+    # Radiology render knobs
     app.state.max_pages = int(os.getenv("MD_MAX_PAGES", "3"))
     app.state.render_zoom = float(os.getenv("MD_RENDER_ZOOM", "3.8"))
     app.state.max_total_images = int(os.getenv("MD_MAX_IMAGES", "10"))
@@ -235,14 +236,10 @@ def _img_part_from_png(png_bytes: bytes) -> Dict[str, Any]:
 
 
 # =========================
-# GENAI RESPONSE TEXT (FIXED: object OR dict)
+# GENAI RESPONSE TEXT (ROBUST)
 # =========================
 def genai_text(resp) -> str:
-    """
-    Robustly extract text even when resp.text is empty.
-    Handles both object-style and dict-style google-genai responses.
-    """
-    # 1) Prefer resp.text if present
+    # 1) Prefer resp.text
     try:
         t = getattr(resp, "text", None)
         if t and str(t).strip():
@@ -250,7 +247,7 @@ def genai_text(resp) -> str:
     except Exception:
         pass
 
-    # 2) Try dict-like access
+    # 2) dict-like
     try:
         if isinstance(resp, dict):
             t = resp.get("text")
@@ -259,7 +256,7 @@ def genai_text(resp) -> str:
     except Exception:
         pass
 
-    # 3) Walk candidates -> content -> parts (object or dict)
+    # 3) candidates -> content -> parts
     out: List[str] = []
     try:
         candidates = getattr(resp, "candidates", None)
@@ -282,7 +279,6 @@ def genai_text(resp) -> str:
                     pt = p.get("text")
                 else:
                     pt = getattr(p, "text", None)
-
                 if pt and str(pt).strip():
                     out.append(str(pt).strip())
     except Exception:
@@ -292,20 +288,20 @@ def genai_text(resp) -> str:
 
 
 # =========================
-# LAB HELPERS
+# LAB JSON PARSE HELPERS
 # =========================
-def _strip_code_fences(s: str) -> str:
+def strip_code_fences(s: str) -> str:
     if not s:
         return ""
-    s = re.sub(r"```(?:json)?", "", s, flags=re.IGNORECASE)
-    s = s.replace("```", "")
+    s = s.replace("```json", "").replace("```JSON", "").replace("```", "")
     return s.strip()
 
 
-def _extract_first_balanced_json_object(s: str) -> Optional[dict]:
-    s = _strip_code_fences(s)
+def extract_first_json_object(s: str) -> Optional[dict]:
+    s = strip_code_fences(s)
     if not s:
         return None
+
     start = s.find("{")
     if start == -1:
         return None
@@ -313,6 +309,7 @@ def _extract_first_balanced_json_object(s: str) -> Optional[dict]:
     depth = 0
     in_str = False
     esc = False
+
     for i in range(start, len(s)):
         ch = s[i]
         if in_str:
@@ -351,19 +348,9 @@ def _has_all_lab_sections(text: str) -> bool:
     return all(re.search(p, t, flags=re.IGNORECASE) for p in patterns)
 
 
-def _looks_truncated(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return True
-    if "<<<END>>>" in t:
-        return False
-    if t[-1].isalnum() or t.endswith(("•", "-", "(", "/", ",")):
-        return True
-    return False
-
-
 def finalize_lab_summary(text: str) -> str:
     t = (text or "").strip()
+    # If model accidentally used FINDINGS heading, normalize it
     t = re.sub(r"\bFINDINGS\s*:", "KEY ABNORMALITIES:", t, flags=re.IGNORECASE)
 
     required = [
@@ -414,38 +401,41 @@ def finalize_lab_summary(text: str) -> str:
 
 
 # =========================
-# GEMINI - LAB (TEXT PIPELINE)
+# LAB: JSON EXTRACT (ROBUST + RETRY) + FALLBACK
 # =========================
-def gemini_lab_extract_json(extracted_text: str) -> dict:
+def lab_extract_json_robust(extracted_text: str) -> Optional[dict]:
     require_client()
     client = app.state.client
     model = app.state.model
 
-    lab_text = (extracted_text or "").strip()[:LAB_TEXT_SLICE]
+    lab_text = (extracted_text or "").strip()
     if not lab_text:
-        raise RuntimeError("Empty extracted_text passed to lab JSON extraction.")
+        return None
+
+    lab_text = lab_text[:LAB_TEXT_SLICE]
 
     prompt = f"""
-Return ONLY valid JSON. No commentary. No markdown.
+Return ONLY a single JSON object. No markdown. No commentary.
 
 Schema:
 {{
-  "doc_type_guess": "lab" | "imaging" | "unknown",
-  "abnormal_results": [
-    {{"test":"string","value":"string|null","unit":"string|null","flag":"High|Low|Abnormal|null","reference_range":"string|null"}}
+  "impression": "string",
+  "abnormalities": [
+    {{"test":"string","value":"string","unit":"string","flag":"High|Low|Abnormal|Normal|Not shown","range":"string"}}
   ],
-  "notable_normal_results": [
-    {{"test":"string","value":"string|null","unit":"string|null"}}
-  ],
-  "free_text_notes":"string|null"
+  "what_this_may_suggest": "string",
+  "what_to_confirm": ["string"],
+  "next_steps": ["string"],
+  "limitations": ["string"]
 }}
 
 Rules:
 - Do NOT invent values.
-- Max 15 abnormal, max 8 normal.
-- If this looks like imaging (CT/X-ray/MRI, nodule, lymphadenopathy, carcinoma), set doc_type_guess="imaging".
+- If missing or unreadable, use "Not shown".
+- Max abnormalities: 12
+- End immediately after the final }}.
 
-LAB REPORT TEXT:
+LAB REPORT:
 {lab_text}
 """.strip()
 
@@ -461,36 +451,48 @@ LAB REPORT TEXT:
             clean_ai_error(e)
 
         last_raw = genai_text(resp)
-        dbg_text(f"LAB_JSON_RAW_attempt_{attempt}", last_raw)
+        dbg_text(f"LAB_JSON_RAW_attempt_{attempt}", last_raw, n=700)
 
-        data = _extract_first_balanced_json_object(last_raw)
-        if data is not None:
+        data = extract_first_json_object(last_raw or "")
+        if isinstance(data, dict):
             return data
 
-        prompt = "Return ONLY a single JSON object.\n\n" + prompt
+        prompt = "ONLY JSON. " + prompt
 
-    raise RuntimeError(f"Could not parse lab JSON. Raw (first 300): {last_raw[:300]!r}")
+    dbg_text("LAB_JSON_FAILED_RAW", last_raw, n=1200)
+    return None
 
 
-def gemini_lab_summary_from_json(data: dict) -> str:
+def lab_summary_from_json(data: dict) -> str:
     require_client()
     client = app.state.client
     model = app.state.model
 
     prompt = f"""
-You are a clinical LAB report summarizer.
+Write a complete lab summary using EXACT headings.
 
-STRICT RULES:
-- Do NOT invent values.
-- If null, write "not shown".
-- Use ONLY these headings in order:
 IMPRESSION:
+<1-3 lines>
+
 KEY ABNORMALITIES:
+• <3-12 bullets>
+
 WHAT THIS MAY SUGGEST:
+<2-6 short lines>
+
 WHAT TO CONFIRM:
+• <2-6 bullets>
+
 NEXT STEPS:
+• <2-6 bullets>
+
 LIMITATIONS:
-- End with <<<END>>>.
+• <1-4 bullets>
+
+Rules:
+- Do NOT invent values.
+- If "Not shown", keep it.
+- End with <<<END>>> on its own line.
 
 JSON:
 {json.dumps(data, ensure_ascii=False)}
@@ -500,153 +502,71 @@ JSON:
         resp = client.models.generate_content(
             model=model,
             contents=[{"role": "user", "parts": [{"text": prompt}]}],
-            config={
-                "temperature": 0.1,
-                "max_output_tokens": LAB_SUMMARY_MAX_TOKENS,
-                "stop_sequences": ["<<<END>>>"],
-            },
+            config={"temperature": 0.2, "max_output_tokens": LAB_SUMMARY_MAX_TOKENS, "stop_sequences": ["<<<END>>>"]},
         )
     except Exception as e:
         clean_ai_error(e)
 
     text = genai_text(resp)
-    dbg_text("LAB_SUMMARY_JSON_RAW", text)
+    dbg_text("LAB_SUMMARY_FROM_JSON_RAW", text, n=900)
 
-    # 🚨 FAIL LOUDLY if empty (so you don't get fake "Not shown" PDFs)
-    if not text.strip():
-        raise RuntimeError("Gemini returned empty text for LAB summary (json-based).")
-
-    tries = 0
-    while (_looks_truncated(text) or (not _has_all_lab_sections(text))) and tries < LAB_CONTINUE_MAX_TRIES:
-        tries += 1
-        cont_prompt = """
-Continue EXACTLY from where you left off.
-Do NOT repeat previous lines.
-Finish cut-off bullets/sentences.
-Ensure all required headings exist.
-End with <<<END>>>.
-""".strip()
-
-        try:
-            resp2 = client.models.generate_content(
-                model=model,
-                contents=[
-                    {"role": "model", "parts": [{"text": text}]},
-                    {"role": "user", "parts": [{"text": cont_prompt}]},
-                ],
-                config={
-                    "temperature": 0.1,
-                    "max_output_tokens": 1200,
-                    "stop_sequences": ["<<<END>>>"],
-                },
-            )
-        except Exception as e:
-            clean_ai_error(e)
-
-        text2 = genai_text(resp2)
-        dbg_text(f"LAB_SUMMARY_CONT_{tries}", text2)
-        if not text2:
-            break
-        text = (text + "\n" + text2).strip()
+    if not (text or "").strip():
+        raise RuntimeError("Lab summary-from-JSON returned empty text")
 
     text = (text or "").replace("<<<END>>>", "").strip()
     return finalize_lab_summary(text)
 
 
-def gemini_lab_summary_plain_text(extracted_text: str) -> str:
+def lab_summary_plain_fallback(extracted_text: str) -> str:
     require_client()
     client = app.state.client
     model = app.state.model
 
-    # -------------------------
-    # STEP 1: Extract JSON
-    # -------------------------
-    extract_prompt = f"""
-Extract important abnormal lab findings from the following lab report.
+    lab_text = (extracted_text or "").strip()[:LAB_TEXT_SLICE]
 
-Return ONLY JSON in this exact format:
-
-{{
-  "impression": "...",
-  "abnormalities": ["...", "..."],
-  "suggestions": "...",
-  "confirm": ["...", "..."],
-  "next_steps": ["...", "..."],
-  "limitations": ["...", "..."]
-}}
-
-LAB REPORT:
-{extracted_text[:6000]}
-"""
-
-    resp1 = client.models.generate_content(
-        model=model,
-        contents=[{"role": "user", "parts": [{"text": extract_prompt}]}],
-        config={"temperature": 0.1, "max_output_tokens": 1200},
-    )
-
-    json_text = genai_text(resp1)
-
-    if not json_text.strip():
-        raise RuntimeError("JSON extraction failed")
-
-    # -------------------------
-    # STEP 2: Summarize JSON
-    # -------------------------
-    summary_prompt = f"""
-Convert this JSON into a clinical summary.
-
-FORMAT EXACTLY:
+    prompt = f"""
+Summarize this lab report with EXACT headings.
 
 IMPRESSION:
-...
-
 KEY ABNORMALITIES:
-• ...
-• ...
-
 WHAT THIS MAY SUGGEST:
-...
-
 WHAT TO CONFIRM:
-• ...
-
 NEXT STEPS:
-• ...
-
 LIMITATIONS:
-• ...
 
-JSON:
-{json_text}
-"""
+Rules:
+- Do NOT invent values.
+- If missing, write "Not shown".
+- End with <<<END>>> on its own line.
 
-    resp2 = client.models.generate_content(
-        model=model,
-        contents=[{"role": "user", "parts": [{"text": summary_prompt}]}],
-        config={"temperature": 0.2, "max_output_tokens": 1500},
-    )
+LAB REPORT:
+{lab_text}
+""".strip()
 
-    final = genai_text(resp2)
-
-    if not final.strip():
-        raise RuntimeError("Summary generation failed")
-
-    return final.strip()
-
-
-def gemini_lab_summary_text_pipeline(extracted_text: str) -> str:
-    # 1) JSON pipeline
     try:
-        data = gemini_lab_extract_json(extracted_text)
-        if str(data.get("doc_type_guess", "")).lower() == "imaging":
-            return "__REROUTE_IMAGING__"
-        return gemini_lab_summary_from_json(data)
+        resp = client.models.generate_content(
+            model=model,
+            contents=[{"role": "user", "parts": [{"text": prompt}]}],
+            config={"temperature": 0.2, "max_output_tokens": LAB_SUMMARY_MAX_TOKENS, "stop_sequences": ["<<<END>>>"]},
+        )
     except Exception as e:
-        dbg_kv("LAB_JSON_PIPELINE_FAILED", str(e))
+        clean_ai_error(e)
 
-    # 2) Plain text fallback
-    return gemini_lab_summary_plain_text(extracted_text)
+    text = genai_text(resp)
+    dbg_text("LAB_SUMMARY_PLAIN_RAW", text, n=900)
+
+    if not (text or "").strip():
+        raise RuntimeError("Lab plain fallback returned empty text")
+
+    text = (text or "").replace("<<<END>>>", "").strip()
+    return finalize_lab_summary(text)
+
+
+def lab_summary_text_pipeline(extracted_text: str) -> str:
+    data = lab_extract_json_robust(extracted_text)
+    if data:
+        return lab_summary_from_json(data)
+    return lab_summary_plain_fallback(extracted_text)
 
 
 # =========================
@@ -660,17 +580,18 @@ def gemini_lab_summary_from_images(all_images: List[bytes]) -> str:
     prompt = """
 You are a clinical LAB report summarizer (from images).
 
-STRICT RULES:
-- Do NOT invent values.
-- If unreadable, write "not shown".
-- Use ONLY these headings in order:
+Use ONLY these headings in order:
 IMPRESSION:
 KEY ABNORMALITIES:
 WHAT THIS MAY SUGGEST:
 WHAT TO CONFIRM:
 NEXT STEPS:
 LIMITATIONS:
-- End with <<<END>>>.
+
+Rules:
+- Do NOT invent values.
+- If unreadable, write "Not shown".
+- End with <<<END>>> on its own line.
 """.strip()
 
     parts = [_img_part_from_png(p) for p in all_images[: app.state.max_total_images]]
@@ -680,20 +601,15 @@ LIMITATIONS:
         resp = client.models.generate_content(
             model=model,
             contents=[{"role": "user", "parts": parts}],
-            config={
-                "temperature": 0.1,
-                "max_output_tokens": LAB_SUMMARY_MAX_TOKENS,
-                "stop_sequences": ["<<<END>>>"],
-            },
+            config={"temperature": 0.1, "max_output_tokens": LAB_SUMMARY_MAX_TOKENS, "stop_sequences": ["<<<END>>>"]},
         )
     except Exception as e:
         clean_ai_error(e)
 
     text = genai_text(resp)
-    dbg_text("LAB_SUMMARY_IMAGE_RAW", text)
+    dbg_text("LAB_SUMMARY_IMAGE_RAW", text, n=900)
 
-    # 🚨 FAIL LOUDLY if empty
-    if not text.strip():
+    if not (text or "").strip():
         raise RuntimeError("Gemini returned empty text for LAB summary (image).")
 
     text = (text or "").replace("<<<END>>>", "").strip()
@@ -701,7 +617,7 @@ LIMITATIONS:
 
 
 # =========================
-# GEMINI - RADIOLOGY (simple; your existing is fine)
+# GEMINI - RADIOLOGY
 # =========================
 def gemini_pass_1_identify(all_images: List[bytes], page_count: int) -> str:
     require_client()
@@ -900,6 +816,9 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
         logo_reader = ImageReader(LOGO_PATH_FALLBACK)
 
     def draw_header_footer(canvas, doc):
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib import colors
+
         w, h = letter
         canvas.saveState()
 
@@ -945,6 +864,7 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
             16,
             "AI-generated summary for informational use only. Confirm with a clinician."
         )
+
         canvas.restoreState()
 
     doc = SimpleDocTemplate(
@@ -1049,13 +969,11 @@ def process(rid: str):
         page_count = get_pdf_page_count(pdf_path)
         extracted_text = extract_pdf_text(pdf_path, max_pages=8)
 
-        # Debug extraction
         dbg_kv("EXTRACTED_TEXT_LEN", len(extracted_text or ""))
         dbg_text("EXTRACTED_TEXT_HEAD", (extracted_text or "")[:1200], n=1200)
 
         doc_type = detect_doc_type_from_text(extracted_text)
 
-        # If it smells like lab, force lab
         tlow = (extracted_text or "").lower()
         force_lab_terms = ["cbc", "hemoglobin", "haemoglobin", "platelet", "wbc", "rbc", "mcv", "mch", "rdw", "reference range"]
         if any(k in tlow for k in force_lab_terms):
@@ -1063,30 +981,21 @@ def process(rid: str):
 
         images_sent = 0
 
-        # =====================
         # LAB FLOW
-        # =====================
         if doc_type == "lab":
             if extracted_text and len(extracted_text.strip()) >= 120:
-                summary = gemini_lab_summary_text_pipeline(extracted_text)
-
-                # If JSON extractor says it's imaging -> reroute
-                if summary == "__REROUTE_IMAGING__":
-                    doc_type = "radiology"
-                else:
-                    summary = finalize_lab_summary(summary)
+                summary = lab_summary_text_pipeline(extracted_text)
+                summary = finalize_lab_summary(summary)
+                images_sent = 0
             else:
-                # text extraction failed or too short -> image lab summary
                 pages_png = render_pdf_pages_to_png_bytes(pdf_path, max_pages=3, zoom=3.2)
                 all_images = pages_png[: app.state.max_total_images]
                 images_sent = len(all_images)
                 summary = gemini_lab_summary_from_images(all_images)
                 summary = finalize_lab_summary(summary)
 
-        # =====================
         # RADIOLOGY FLOW
-        # =====================
-        if doc_type == "radiology":
+        else:
             pages_png = render_pdf_pages_to_png_bytes(
                 pdf_path,
                 max_pages=app.state.max_pages,
@@ -1100,6 +1009,8 @@ def process(rid: str):
             all_images = all_images[: app.state.max_total_images]
             images_sent = len(all_images)
 
+            # You can keep your full radiology prompts here if you want;
+            # leaving minimal versions in this file.
             context = gemini_pass_1_identify(all_images, page_count)
             summary = gemini_pass_2_radiology_report(all_images, context, page_count)
             summary = safety_guard_text(summary)
@@ -1110,7 +1021,6 @@ def process(rid: str):
         print("=== PROCESS ERROR ===")
         print(f"{type(e).__name__}: {e}")
         traceback.print_exc()
-        # In debug, show real error so you can fix it
         if DEBUG_MODE:
             raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail="Processing failed. Please try again later.")
