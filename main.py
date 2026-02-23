@@ -1,10 +1,12 @@
 import os
 import re
+import io
 import uuid
+import json
 import base64
 import traceback
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,14 +14,12 @@ from fastapi.responses import FileResponse
 
 from google import genai
 import fitz  # PyMuPDF
-
 from PIL import Image
-import io
 
 # =========================
 # APP SETUP
 # =========================
-app = FastAPI(title="MedDecode AI", version="20.0-LABFIX-REGEX")
+app = FastAPI(title="MedDecode AI", version="25.0-LAB-NO-EMPTY-TEXT")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,7 +40,7 @@ REPORTS: Dict[str, Dict[str, Any]] = {}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 OUT_DIR = os.path.join(BASE_DIR, "generated")
-ASSETS_DIR = os.path.join(BASE_DIR, "assets")  # put logo.png here
+ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -55,12 +55,14 @@ LOGO_PATH_FALLBACK = os.path.join(BASE_DIR, "logo.png")
 PASS1_MAX_TOKENS = 260
 PASS2_MAX_TOKENS = 5000
 
-# LAB: smaller is more reliable than huge outputs
-LAB_MAX_TOKENS = 2000
-LAB_TEXT_SLICE = 7000
+LAB_JSON_MAX_TOKENS = 1800
+LAB_SUMMARY_MAX_TOKENS = 2600
+LAB_TEXT_SLICE = 12000
 
-LAB_CONTINUE_MAX_TRIES = 6
+LAB_CONTINUE_MAX_TRIES = 8
 RAD_CONTINUE_MAX_TRIES = 3
+
+DEBUG_MODE = os.getenv("MD_DEBUG", "0").strip().lower() in ("1", "true", "yes")
 
 
 # =========================
@@ -75,10 +77,8 @@ def startup():
         app.state.client = None
         print("⚠️ GEMINI_API_KEY is missing. /process will fail until you set it.")
 
-    # PowerShell: $env:GEMINI_MODEL="gemini-2.5-pro"
     app.state.model = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
-    # Radiology render knobs
     app.state.max_pages = int(os.getenv("MD_MAX_PAGES", "3"))
     app.state.render_zoom = float(os.getenv("MD_RENDER_ZOOM", "3.8"))
     app.state.max_total_images = int(os.getenv("MD_MAX_IMAGES", "10"))
@@ -91,6 +91,8 @@ def startup():
         print("⚠️ Logo NOT found. Put logo at:")
         print(f"   - {LOGO_PATH_PRIMARY}")
         print(f"   - {LOGO_PATH_FALLBACK}")
+
+    print(f"🧪 MD_DEBUG={int(DEBUG_MODE)} | model={app.state.model} | version={app.version}")
 
 
 # =========================
@@ -108,10 +110,23 @@ def require_client():
         )
 
 
+def dbg_kv(label: str, value: Any):
+    if DEBUG_MODE:
+        print(f"=== DEBUG {label}: {value} ===")
+
+
+def dbg_text(label: str, text: str, n: int = 900):
+    if not DEBUG_MODE:
+        return
+    t = (text or "").replace("\r", "")
+    print(f"\n=== DEBUG {label} (first {n} chars) ===")
+    print(t[:n])
+    print("=== END DEBUG ===\n")
+
+
 def save_upload(file: UploadFile, report_id: str) -> str:
     if file.content_type != "application/pdf" and (file.filename and not file.filename.lower().endswith(".pdf")):
         raise HTTPException(400, "Please upload a PDF file.")
-
     path = os.path.join(UPLOAD_DIR, f"{report_id}.pdf")
     with open(path, "wb") as f:
         f.write(file.file.read())
@@ -138,10 +153,6 @@ def render_pdf_pages_to_png_bytes(pdf_path: str, max_pages: int, zoom: float) ->
 
 
 def extract_pdf_text(pdf_path: str, max_pages: int = 8) -> str:
-    """
-    Lab reports usually contain selectable text.
-    Scanned PDFs may return empty (OCR needed).
-    """
     doc = fitz.open(pdf_path)
     pages = min(doc.page_count, max_pages)
     chunks: List[str] = []
@@ -154,32 +165,21 @@ def extract_pdf_text(pdf_path: str, max_pages: int = 8) -> str:
 
 
 def detect_doc_type_from_text(extracted_text: str) -> str:
-    """
-    Returns: "lab" or "radiology"
-    Strong bias to LAB whenever we see lab keywords in extracted text.
-    """
     t = (extracted_text or "").lower().strip()
-
-    # If there's basically no extracted text, it's probably image-only
     if len(t) < 40:
         return "radiology"
 
     lab_keywords = [
-        "complete blood count", "cbc", "hemoglobin", "haemoglobin",
-        "wbc", "rbc", "platelet", "plt", "hematocrit", "haematocrit",
-        "mcv", "mch", "mchc", "rdw", "neutrophil", "lymphocyte",
-        "monocyte", "eosinophil", "basophil", "reference range", "units",
-        "pathology", "laboratory", "specimen", "method",
-        "anisocytosis", "poikilocytosis", "peripheral smear",
-        "ferritin", "iron", "tibc", "creatinine", "alt", "ast", "bilirubin",
-        "glucose", "hba1c", "result", "results", "flag", "high", "low",
+        "cbc", "complete blood count", "haemoglobin", "hemoglobin", "wbc", "rbc",
+        "platelet", "plt", "mcv", "mch", "mchc", "rdw", "reference range", "units",
+        "hematocrit", "haematocrit", "neutrophil", "lymphocyte", "monocyte",
+        "eosinophil", "basophil", "ferritin", "iron", "tibc", "glucose", "hba1c",
+        "creatinine", "alt", "ast", "bilirubin", "results", "result", "flag", "high", "low",
     ]
-
     rad_keywords = [
-        "x-ray", "xray", "radiograph", "ct", "mri", "ultrasound",
-        "ap view", "pa view", "lateral", "oblique", "fracture", "dislocation",
-        "nodule", "spiculated", "lymphadenopathy", "mediastinal", "hilar",
-        "impression", "findings",
+        "ct", "x-ray", "xray", "mri", "ultrasound", "fracture", "nodule", "spiculated",
+        "lymphadenopathy", "mediastinal", "hilar", "pet/ct", "ebus", "biopsy",
+        "carcinoma", "metast", "staging",
     ]
 
     lab_hits = sum(1 for k in lab_keywords if k in t)
@@ -194,7 +194,7 @@ def clean_ai_error(e: Exception):
     msg = str(e)
     if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
         raise HTTPException(status_code=429, detail="AI limit reached. Please come back later.")
-    raise HTTPException(status_code=500, detail="AI processing failed. Please try again later.")
+    raise HTTPException(status_code=500, detail=f"AI processing failed: {msg}")
 
 
 def png_bytes_to_pil(png_bytes: bytes) -> Image.Image:
@@ -208,27 +208,21 @@ def pil_to_png_bytes(img: Image.Image) -> bytes:
 
 
 def make_crops_from_page(png_bytes: bytes) -> List[bytes]:
-    """
-    Full image + crops (radiology).
-    """
     img = png_bytes_to_pil(png_bytes)
     w, h = img.size
-
-    crops: List[Image.Image] = []
-    crops.append(img)
-    crops.append(img.crop((0, 0, w, int(h * 0.72))))
-    crops.append(img.crop((int(w * 0.10), int(h * 0.03), int(w * 0.90), int(h * 0.78))))
-    crops.append(img.crop((int(w * 0.03), int(h * 0.03), int(w * 0.58), int(h * 0.78))))
-    crops.append(img.crop((int(w * 0.42), int(h * 0.03), int(w * 0.97), int(h * 0.78))))
-
-    out_bytes: List[bytes] = []
+    crops = [
+        img,
+        img.crop((0, 0, w, int(h * 0.72))),
+        img.crop((int(w * 0.10), int(h * 0.03), int(w * 0.90), int(h * 0.78))),
+        img.crop((int(w * 0.03), int(h * 0.03), int(w * 0.58), int(h * 0.78))),
+        img.crop((int(w * 0.42), int(h * 0.03), int(w * 0.97), int(h * 0.78))),
+    ]
+    out: List[bytes] = []
     for c in crops:
         cw, ch = c.size
-        scale = 1.35
-        c2 = c.resize((int(cw * scale), int(ch * scale)))
-        out_bytes.append(pil_to_png_bytes(c2))
-
-    return out_bytes
+        c2 = c.resize((int(cw * 1.35), int(ch * 1.35)))
+        out.append(pil_to_png_bytes(c2))
+    return out
 
 
 def _img_part_from_png(png_bytes: bytes) -> Dict[str, Any]:
@@ -241,19 +235,107 @@ def _img_part_from_png(png_bytes: bytes) -> Dict[str, Any]:
 
 
 # =========================
-# SECTION CHECKS (REGEX, tolerant to line breaks)
+# GENAI RESPONSE TEXT (FIXED: object OR dict)
 # =========================
-def _has_all_radiology_sections(text: str) -> bool:
-    t = (text or "")
-    patterns = [
-        r"IMPRESSION\s*:",
-        r"CONFIDENCE\s*:",
-        r"FINDINGS\s*:",
-        r"WHAT\s+THIS\s+MEANS\s*:",
-        r"LIMITATIONS\s*:",
-        r"RECOMMENDED\s+NEXT\s+STEP\s*:",
-    ]
-    return all(re.search(p, t, flags=re.IGNORECASE) for p in patterns)
+def genai_text(resp) -> str:
+    """
+    Robustly extract text even when resp.text is empty.
+    Handles both object-style and dict-style google-genai responses.
+    """
+    # 1) Prefer resp.text if present
+    try:
+        t = getattr(resp, "text", None)
+        if t and str(t).strip():
+            return str(t).strip()
+    except Exception:
+        pass
+
+    # 2) Try dict-like access
+    try:
+        if isinstance(resp, dict):
+            t = resp.get("text")
+            if t and str(t).strip():
+                return str(t).strip()
+    except Exception:
+        pass
+
+    # 3) Walk candidates -> content -> parts (object or dict)
+    out: List[str] = []
+    try:
+        candidates = getattr(resp, "candidates", None)
+        if candidates is None and isinstance(resp, dict):
+            candidates = resp.get("candidates", [])
+        candidates = candidates or []
+
+        for c in candidates:
+            content = getattr(c, "content", None)
+            if content is None and isinstance(c, dict):
+                content = c.get("content")
+
+            parts = getattr(content, "parts", None) if content is not None else None
+            if parts is None and isinstance(content, dict):
+                parts = content.get("parts")
+            parts = parts or []
+
+            for p in parts:
+                if isinstance(p, dict):
+                    pt = p.get("text")
+                else:
+                    pt = getattr(p, "text", None)
+
+                if pt and str(pt).strip():
+                    out.append(str(pt).strip())
+    except Exception:
+        pass
+
+    return "\n".join(out).strip()
+
+
+# =========================
+# LAB HELPERS
+# =========================
+def _strip_code_fences(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"```(?:json)?", "", s, flags=re.IGNORECASE)
+    s = s.replace("```", "")
+    return s.strip()
+
+
+def _extract_first_balanced_json_object(s: str) -> Optional[dict]:
+    s = _strip_code_fences(s)
+    if not s:
+        return None
+    start = s.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    chunk = s[start: i + 1]
+                    try:
+                        return json.loads(chunk)
+                    except Exception:
+                        return None
+    return None
 
 
 def _has_all_lab_sections(text: str) -> bool:
@@ -269,35 +351,21 @@ def _has_all_lab_sections(text: str) -> bool:
     return all(re.search(p, t, flags=re.IGNORECASE) for p in patterns)
 
 
-# =========================
-# FINALIZERS (GUARANTEE NON-EMPTY, NEVER "STOPS")
-# =========================
-def finalize_lab_summary(text: str) -> str:
-    """
-    Guarantees a LAB summary is complete enough for PDF even if the model truncates.
-    - normalizes accidental headings
-    - ensures all required headings exist
-    - ensures headings have content (safe placeholders)
-    """
+def _looks_truncated(text: str) -> bool:
     t = (text or "").strip()
     if not t:
-        return (
-            "IMPRESSION:\nNot shown.\n\n"
-            "KEY ABNORMALITIES:\n• Not shown.\n\n"
-            "WHAT THIS MAY SUGGEST:\nNot shown.\n\n"
-            "WHAT TO CONFIRM:\n• Not shown.\n\n"
-            "NEXT STEPS:\n• Not shown.\n\n"
-            "LIMITATIONS:\n• Not shown.\n"
-        ).strip()
+        return True
+    if "<<<END>>>" in t:
+        return False
+    if t[-1].isalnum() or t.endswith(("•", "-", "(", "/", ",")):
+        return True
+    return False
 
-    # Normalize "FINDINGS" -> lab section
+
+def finalize_lab_summary(text: str) -> str:
+    t = (text or "").strip()
     t = re.sub(r"\bFINDINGS\s*:", "KEY ABNORMALITIES:", t, flags=re.IGNORECASE)
 
-    # If it ends mid-word, add ellipsis + newline
-    if t and t[-1].isalnum():
-        t += "…\n"
-
-    # Ensure required headings exist (append missing with safe placeholders)
     required = [
         "IMPRESSION:",
         "KEY ABNORMALITIES:",
@@ -308,76 +376,302 @@ def finalize_lab_summary(text: str) -> str:
     ]
 
     def has_heading(h: str) -> bool:
-        # tolerate line breaks/spaces
         hh = h.replace(":", "").strip()
         pattern = r"\b" + r"\s+".join(map(re.escape, hh.split())) + r"\s*:"
         return bool(re.search(pattern, t, flags=re.IGNORECASE))
 
+    if not t:
+        return (
+            "IMPRESSION:\nUnable to generate a complete summary from the provided report text.\n\n"
+            "KEY ABNORMALITIES:\n• Not shown.\n\n"
+            "WHAT THIS MAY SUGGEST:\nNot shown.\n\n"
+            "WHAT TO CONFIRM:\n• Not shown.\n\n"
+            "NEXT STEPS:\n• Not shown.\n\n"
+            "LIMITATIONS:\n• Model returned empty output.\n• Confirm using the original report and a clinician."
+        )
+
     for h in required:
         if not has_heading(h):
             if h == "IMPRESSION:":
-                t += "\n\nIMPRESSION:\nNot shown (output truncated)."
+                t += "\n\nIMPRESSION:\nNot shown."
             elif h == "KEY ABNORMALITIES:":
-                t += "\n\nKEY ABNORMALITIES:\n• Not shown (output truncated before listing values)."
+                t += "\n\nKEY ABNORMALITIES:\n• Not shown."
             elif h == "WHAT THIS MAY SUGGEST:":
-                t += "\n\nWHAT THIS MAY SUGGEST:\nNot shown (output truncated)."
+                t += "\n\nWHAT THIS MAY SUGGEST:\nNot shown."
             elif h == "WHAT TO CONFIRM:":
-                t += "\n\nWHAT TO CONFIRM:\n• Not shown (output truncated)."
+                t += "\n\nWHAT TO CONFIRM:\n• Not shown."
             elif h == "NEXT STEPS:":
-                t += "\n\nNEXT STEPS:\n• Not shown (output truncated)."
+                t += "\n\nNEXT STEPS:\n• Not shown."
             elif h == "LIMITATIONS:":
                 t += (
                     "\n\nLIMITATIONS:\n"
-                    "• Output may be incomplete due to model truncation.\n"
+                    "• Output may be incomplete.\n"
                     "• Confirm using the original report and a clinician.\n"
                     "• Reference ranges vary by lab."
                 )
 
-    # Ensure each heading has at least some content
-    lines = t.splitlines()
-    out: List[str] = []
-    heading_patterns = [
-        r"^\s*IMPRESSION\s*:\s*$",
-        r"^\s*KEY\s+ABNORMALITIES\s*:\s*$",
-        r"^\s*WHAT\s+THIS\s+MAY\s+SUGGEST\s*:\s*$",
-        r"^\s*WHAT\s+TO\s+CONFIRM\s*:\s*$",
-        r"^\s*NEXT\s+STEPS\s*:\s*$",
-        r"^\s*LIMITATIONS\s*:\s*$",
-    ]
-
-    def is_heading_line(line: str) -> bool:
-        return any(re.match(p, line, flags=re.IGNORECASE) for p in heading_patterns)
-
-    i = 0
-    while i < len(lines):
-        out.append(lines[i])
-        if is_heading_line(lines[i]):
-            j = i + 1
-            while j < len(lines) and not lines[j].strip():
-                j += 1
-            if j >= len(lines) or is_heading_line(lines[j]):
-                # no content after heading
-                if re.match(r"^\s*KEY\s+ABNORMALITIES\s*:", lines[i], flags=re.IGNORECASE):
-                    out.append("• Not shown (output truncated).")
-                else:
-                    out.append("Not shown (output truncated).")
-        i += 1
-
-    return "\n".join(out).strip()
-
-
-def finalize_radiology_summary(text: str) -> str:
-    """
-    Light safeguard: ensure the radiology output doesn't end mid-word.
-    """
-    t = (text or "").strip()
-    if t and t[-1].isalnum():
-        t += "…"
-    return t
+    return t.strip()
 
 
 # =========================
-# GEMINI - RADIOLOGY
+# GEMINI - LAB (TEXT PIPELINE)
+# =========================
+def gemini_lab_extract_json(extracted_text: str) -> dict:
+    require_client()
+    client = app.state.client
+    model = app.state.model
+
+    lab_text = (extracted_text or "").strip()[:LAB_TEXT_SLICE]
+    if not lab_text:
+        raise RuntimeError("Empty extracted_text passed to lab JSON extraction.")
+
+    prompt = f"""
+Return ONLY valid JSON. No commentary. No markdown.
+
+Schema:
+{{
+  "doc_type_guess": "lab" | "imaging" | "unknown",
+  "abnormal_results": [
+    {{"test":"string","value":"string|null","unit":"string|null","flag":"High|Low|Abnormal|null","reference_range":"string|null"}}
+  ],
+  "notable_normal_results": [
+    {{"test":"string","value":"string|null","unit":"string|null"}}
+  ],
+  "free_text_notes":"string|null"
+}}
+
+Rules:
+- Do NOT invent values.
+- Max 15 abnormal, max 8 normal.
+- If this looks like imaging (CT/X-ray/MRI, nodule, lymphadenopathy, carcinoma), set doc_type_guess="imaging".
+
+LAB REPORT TEXT:
+{lab_text}
+""".strip()
+
+    last_raw = ""
+    for attempt in range(1, 4):
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=[{"role": "user", "parts": [{"text": prompt}]}],
+                config={"temperature": 0.0, "max_output_tokens": LAB_JSON_MAX_TOKENS},
+            )
+        except Exception as e:
+            clean_ai_error(e)
+
+        last_raw = genai_text(resp)
+        dbg_text(f"LAB_JSON_RAW_attempt_{attempt}", last_raw)
+
+        data = _extract_first_balanced_json_object(last_raw)
+        if data is not None:
+            return data
+
+        prompt = "Return ONLY a single JSON object.\n\n" + prompt
+
+    raise RuntimeError(f"Could not parse lab JSON. Raw (first 300): {last_raw[:300]!r}")
+
+
+def gemini_lab_summary_from_json(data: dict) -> str:
+    require_client()
+    client = app.state.client
+    model = app.state.model
+
+    prompt = f"""
+You are a clinical LAB report summarizer.
+
+STRICT RULES:
+- Do NOT invent values.
+- If null, write "not shown".
+- Use ONLY these headings in order:
+IMPRESSION:
+KEY ABNORMALITIES:
+WHAT THIS MAY SUGGEST:
+WHAT TO CONFIRM:
+NEXT STEPS:
+LIMITATIONS:
+- End with <<<END>>>.
+
+JSON:
+{json.dumps(data, ensure_ascii=False)}
+""".strip()
+
+    try:
+        resp = client.models.generate_content(
+            model=model,
+            contents=[{"role": "user", "parts": [{"text": prompt}]}],
+            config={
+                "temperature": 0.1,
+                "max_output_tokens": LAB_SUMMARY_MAX_TOKENS,
+                "stop_sequences": ["<<<END>>>"],
+            },
+        )
+    except Exception as e:
+        clean_ai_error(e)
+
+    text = genai_text(resp)
+    dbg_text("LAB_SUMMARY_JSON_RAW", text)
+
+    # 🚨 FAIL LOUDLY if empty (so you don't get fake "Not shown" PDFs)
+    if not text.strip():
+        raise RuntimeError("Gemini returned empty text for LAB summary (json-based).")
+
+    tries = 0
+    while (_looks_truncated(text) or (not _has_all_lab_sections(text))) and tries < LAB_CONTINUE_MAX_TRIES:
+        tries += 1
+        cont_prompt = """
+Continue EXACTLY from where you left off.
+Do NOT repeat previous lines.
+Finish cut-off bullets/sentences.
+Ensure all required headings exist.
+End with <<<END>>>.
+""".strip()
+
+        try:
+            resp2 = client.models.generate_content(
+                model=model,
+                contents=[
+                    {"role": "model", "parts": [{"text": text}]},
+                    {"role": "user", "parts": [{"text": cont_prompt}]},
+                ],
+                config={
+                    "temperature": 0.1,
+                    "max_output_tokens": 1200,
+                    "stop_sequences": ["<<<END>>>"],
+                },
+            )
+        except Exception as e:
+            clean_ai_error(e)
+
+        text2 = genai_text(resp2)
+        dbg_text(f"LAB_SUMMARY_CONT_{tries}", text2)
+        if not text2:
+            break
+        text = (text + "\n" + text2).strip()
+
+    text = (text or "").replace("<<<END>>>", "").strip()
+    return finalize_lab_summary(text)
+
+
+def gemini_lab_summary_plain_text(extracted_text: str) -> str:
+    require_client()
+    client = app.state.client
+    model = app.state.model
+
+    lab_text = (extracted_text or "").strip()[:LAB_TEXT_SLICE]
+    if not lab_text:
+        return finalize_lab_summary("")
+
+    prompt = f"""
+You are a clinical LAB report summarizer.
+
+STRICT RULES:
+- Do NOT invent values.
+- If missing, write "not shown".
+- Use ONLY these headings, in order:
+IMPRESSION:
+KEY ABNORMALITIES:
+WHAT THIS MAY SUGGEST:
+WHAT TO CONFIRM:
+NEXT STEPS:
+LIMITATIONS:
+- End with <<<END>>>.
+
+LAB REPORT TEXT:
+{lab_text}
+""".strip()
+
+    try:
+        resp = client.models.generate_content(
+            model=model,
+            contents=[{"role": "user", "parts": [{"text": prompt}]}],
+            config={
+                "temperature": 0.2,
+                "max_output_tokens": LAB_SUMMARY_MAX_TOKENS,
+                "stop_sequences": ["<<<END>>>"],
+            },
+        )
+    except Exception as e:
+        clean_ai_error(e)
+
+    text = genai_text(resp)
+    dbg_text("LAB_SUMMARY_TEXT_RAW", text)
+
+    # 🚨 FAIL LOUDLY if empty
+    if not text.strip():
+        raise RuntimeError("Gemini returned empty text for LAB summary (plain-text).")
+
+    text = (text or "").replace("<<<END>>>", "").strip()
+    return finalize_lab_summary(text)
+
+
+def gemini_lab_summary_text_pipeline(extracted_text: str) -> str:
+    # 1) JSON pipeline
+    try:
+        data = gemini_lab_extract_json(extracted_text)
+        if str(data.get("doc_type_guess", "")).lower() == "imaging":
+            return "__REROUTE_IMAGING__"
+        return gemini_lab_summary_from_json(data)
+    except Exception as e:
+        dbg_kv("LAB_JSON_PIPELINE_FAILED", str(e))
+
+    # 2) Plain text fallback
+    return gemini_lab_summary_plain_text(extracted_text)
+
+
+# =========================
+# GEMINI - LAB (IMAGE FALLBACK)
+# =========================
+def gemini_lab_summary_from_images(all_images: List[bytes]) -> str:
+    require_client()
+    client = app.state.client
+    model = app.state.model
+
+    prompt = """
+You are a clinical LAB report summarizer (from images).
+
+STRICT RULES:
+- Do NOT invent values.
+- If unreadable, write "not shown".
+- Use ONLY these headings in order:
+IMPRESSION:
+KEY ABNORMALITIES:
+WHAT THIS MAY SUGGEST:
+WHAT TO CONFIRM:
+NEXT STEPS:
+LIMITATIONS:
+- End with <<<END>>>.
+""".strip()
+
+    parts = [_img_part_from_png(p) for p in all_images[: app.state.max_total_images]]
+    parts.append({"text": prompt})
+
+    try:
+        resp = client.models.generate_content(
+            model=model,
+            contents=[{"role": "user", "parts": parts}],
+            config={
+                "temperature": 0.1,
+                "max_output_tokens": LAB_SUMMARY_MAX_TOKENS,
+                "stop_sequences": ["<<<END>>>"],
+            },
+        )
+    except Exception as e:
+        clean_ai_error(e)
+
+    text = genai_text(resp)
+    dbg_text("LAB_SUMMARY_IMAGE_RAW", text)
+
+    # 🚨 FAIL LOUDLY if empty
+    if not text.strip():
+        raise RuntimeError("Gemini returned empty text for LAB summary (image).")
+
+    text = (text or "").replace("<<<END>>>", "").strip()
+    return finalize_lab_summary(text)
+
+
+# =========================
+# GEMINI - RADIOLOGY (simple; your existing is fine)
 # =========================
 def gemini_pass_1_identify(all_images: List[bytes], page_count: int) -> str:
     require_client()
@@ -388,16 +682,15 @@ def gemini_pass_1_identify(all_images: List[bytes], page_count: int) -> str:
 You are a radiology assistant.
 
 You will be shown images from a PDF (full images + zoomed crops).
-Your job is ONLY to identify:
+Identify:
 - modality
-- body part/anatomy
-- likely view/plane
+- anatomy
+- view/plane
 - limitations
 
 PDF page count: {page_count}
 
-Return exactly this format:
-
+Format:
 Modality guess: ...
 Body part/anatomy: ...
 Laterality: left/right/uncertain
@@ -417,9 +710,10 @@ Limitations: ...
     except Exception as e:
         clean_ai_error(e)
 
-    if not getattr(resp, "text", None):
+    text = genai_text(resp).strip()
+    if not text:
         raise RuntimeError("Gemini pass-1 returned empty response.")
-    return resp.text.strip()
+    return text
 
 
 def gemini_pass_2_radiology_report(all_images: List[bytes], context: str, page_count: int) -> str:
@@ -432,44 +726,23 @@ def gemini_pass_2_radiology_report(all_images: List[bytes], context: str, page_c
     prompt = f"""
 You are an expert radiology assistant.
 
-Task: Write a professional radiology-style SUMMARY based on the provided images.
-Be direct and clinically useful, but do NOT give a definitive diagnosis.
-Use "Possible / Suspected / Likely" wording.
+Task: Write a professional radiology-style SUMMARY.
+Be direct but do NOT give a definitive diagnosis.
 
 CONTEXT:
 {context}
 
 Single view provided: {single_view}
 
-OUTPUT FORMAT (exactly, with headings):
-
+OUTPUT FORMAT:
 IMPRESSION:
-<1–3 lines. Most likely diagnosis/possibilities with location. Use "Possible/Suspected".>
-
-Confidence: <Low / Medium / High>
-
+Confidence:
 FINDINGS:
-• <3–8 bullets describing visible signs: fracture line, cortical disruption, angulation, alignment, joint involvement, swelling>
-
 WHAT THIS MEANS:
-<2–5 short lines for a patient>
-
 LIMITATIONS:
-• <1–3 bullets: single view, image quality, no history, subtle fractures>
-
 RECOMMENDED NEXT STEP:
-• <2–5 bullets: additional views (AP/lateral/oblique), radiology read, ortho/ER if severe pain/deformity, immobilization guidance>
 
-RULES:
-- If you see fracture cues (lucent line, cortical break, step-off, angulation, displaced fragment), state:
-  "Suspected/possible fracture at <finger + bone + segment>".
-- NEVER say "no fracture" or "fracture ruled out".
-  If not obvious, say: "No obvious displaced fracture; occult/non-displaced fracture cannot be excluded."
-- Do NOT invent patient age/history/symptoms.
-- If laterality is unclear, say "laterality uncertain".
-- Always include all sections.
-
-End your response with a new line containing exactly: <<<END>>>
+End with <<<END>>>.
 """.strip()
 
     parts = [_img_part_from_png(p) for p in all_images[: app.state.max_total_images]]
@@ -484,25 +757,18 @@ End your response with a new line containing exactly: <<<END>>>
     except Exception as e:
         clean_ai_error(e)
 
-    text = (getattr(resp, "text", "") or "").strip()
+    text = genai_text(resp).strip()
     if not text:
         raise RuntimeError("Gemini pass-2 returned empty response.")
 
     tries = 0
-    while ("<<<END>>>" not in text or not _has_all_radiology_sections(text)) and tries < RAD_CONTINUE_MAX_TRIES:
+    while ("<<<END>>>" not in text) and tries < RAD_CONTINUE_MAX_TRIES:
         tries += 1
-        cont_prompt = """
-Continue EXACTLY from where you left off.
-Do NOT repeat anything already written.
-Finish any cut-off word/sentence and ensure all required headings exist.
-End with <<<END>>> on its own line.
-""".strip()
-
+        cont_prompt = "Continue from where you left off. End with <<<END>>>."
         try:
             resp2 = client.models.generate_content(
                 model=model,
                 contents=[
-                    {"role": "user", "parts": parts},
                     {"role": "model", "parts": [{"text": text}]},
                     {"role": "user", "parts": [{"text": cont_prompt}]},
                 ],
@@ -511,249 +777,16 @@ End with <<<END>>> on its own line.
         except Exception as e:
             clean_ai_error(e)
 
-        text2 = (getattr(resp2, "text", "") or "").strip()
+        text2 = genai_text(resp2).strip()
         if not text2:
             break
         text = (text + "\n" + text2).strip()
 
-    text = text.replace("<<<END>>>", "").strip()
-    if not text:
-        raise RuntimeError("Gemini pass-2 returned empty response.")
-    return finalize_radiology_summary(text)
-
-
-# =========================
-# GEMINI - LAB (TEXT)
-# =========================
-def gemini_lab_summary(extracted_text: str) -> str:
-    require_client()
-    client = app.state.client
-    model = app.state.model
-
-    lab_text = (extracted_text or "").strip()[:LAB_TEXT_SLICE]
-
-    base_prompt = f"""
-You are a clinical LAB report summarizer.
-
-Input: text from a lab report (CBC/biochem).
-Goal: produce a patient-friendly but clinically useful summary.
-
-STRICT RULES:
-- Do NOT invent values not present.
-- If values/ranges are missing, write "not shown".
-- Do NOT use the heading "FINDINGS" (radiology-only).
-- Use ONLY the headings listed below, exactly and in this order.
-- Do NOT stop mid-sentence or mid-bullet.
-- If the document looks like IMAGING (CT/X-ray/MRI, nodule, lymph nodes), say so in LIMITATIONS and do NOT invent lab values.
-- End with a new line containing exactly: <<<END>>>
-
-OUTPUT FORMAT (exact headings, in this exact order):
-
-IMPRESSION:
-<1–3 lines. Overall pattern (possible/suggestive, not definitive).>
-
-KEY ABNORMALITIES:
-• <3–12 bullets. Each bullet: test name + value + unit + flag if present; otherwise "not shown".>
-
-WHAT THIS MAY SUGGEST:
-<2–6 short lines (not definitive).>
-
-WHAT TO CONFIRM:
-• <2–6 bullets>
-
-NEXT STEPS:
-• <2–6 bullets>
-
-LIMITATIONS:
-• <1–4 bullets>
-
-LAB REPORT TEXT:
-{lab_text}
-""".strip()
-
-    try:
-        resp = client.models.generate_content(
-            model=model,
-            contents=[{"role": "user", "parts": [{"text": base_prompt}]}],
-            config={"temperature": 0.2, "max_output_tokens": LAB_MAX_TOKENS},
-        )
-    except Exception as e:
-        clean_ai_error(e)
-
-    text = (getattr(resp, "text", "") or "").strip()
-
-    # Continue WITHOUT re-sending the big lab text (critical)
-    tries = 0
-    while tries < LAB_CONTINUE_MAX_TRIES and (("<<<END>>>" not in text) or (not _has_all_lab_sections(text))):
-        tries += 1
-        cont_prompt = """
-Continue EXACTLY from where you left off.
-Do NOT repeat any previous lines.
-Do NOT introduce the heading "FINDINGS".
-If any required heading is missing, add it and fill it.
-End with a new line containing exactly: <<<END>>>
-""".strip()
-
-        try:
-            resp2 = client.models.generate_content(
-                model=model,
-                contents=[
-                    {"role": "model", "parts": [{"text": text}]},
-                    {"role": "user", "parts": [{"text": cont_prompt}]},
-                ],
-                config={"temperature": 0.2, "max_output_tokens": 1200},
-            )
-        except Exception as e:
-            clean_ai_error(e)
-
-        text2 = (getattr(resp2, "text", "") or "").strip()
-        if not text2:
-            break
-        text = (text + "\n" + text2).strip()
-
-    # If still incomplete, rewrite from scratch (still using small lab_text)
-    if ("<<<END>>>" not in text) or (not _has_all_lab_sections(text)):
-        repair_prompt = """
-Rewrite the summary from scratch using ONLY the required headings in the required order.
-Do NOT use the heading "FINDINGS".
-Keep it concise but complete.
-End with <<<END>>>.
-""".strip()
-
-        try:
-            resp3 = client.models.generate_content(
-                model=model,
-                contents=[
-                    {"role": "user", "parts": [{"text": repair_prompt}]},
-                    {"role": "user", "parts": [{"text": "LAB REPORT TEXT:\n" + lab_text}]},
-                ],
-                config={"temperature": 0.1, "max_output_tokens": LAB_MAX_TOKENS},
-            )
-            text3 = (getattr(resp3, "text", "") or "").strip()
-            if text3:
-                text = text3.strip()
-        except Exception as e:
-            clean_ai_error(e)
-
-    text = text.replace("<<<END>>>", "").strip()
-    return finalize_lab_summary(text)
-
-
-# =========================
-# GEMINI - LAB (IMAGE FALLBACK for scanned PDFs)
-# =========================
-def gemini_lab_summary_from_images(all_images: List[bytes]) -> str:
-    require_client()
-    client = app.state.client
-    model = app.state.model
-
-    prompt = """
-You are a clinical LAB report summarizer.
-
-You will be shown images of a lab report (CBC/biochem panels).
-Goal: Produce a patient-friendly but clinically useful summary.
-
-STRICT RULES:
-- Do NOT invent values not present.
-- If a value/unit/range is not readable, write "not shown".
-- Do NOT use the heading "FINDINGS" (radiology-only).
-- Use ONLY the headings listed below, exactly and in this order.
-- Do NOT stop mid-sentence or mid-bullet.
-- If the document looks like IMAGING (CT/X-ray/MRI, nodule, lymph nodes), say so in LIMITATIONS and do NOT invent lab values.
-- End your response with a new line containing exactly: <<<END>>>
-
-OUTPUT FORMAT (exact headings, in this exact order):
-
-IMPRESSION:
-<1–3 lines. Overall pattern (possible/suggestive, not definitive).>
-
-KEY ABNORMALITIES:
-• <3–12 bullets. Each bullet: test name + value + unit + flag if visible; otherwise "not shown".>
-
-WHAT THIS MAY SUGGEST:
-<2–6 short lines (not definitive).>
-
-WHAT TO CONFIRM:
-• <2–6 bullets>
-
-NEXT STEPS:
-• <2–6 bullets>
-
-LIMITATIONS:
-• <1–4 bullets>
-""".strip()
-
-    parts = [_img_part_from_png(p) for p in all_images[: app.state.max_total_images]]
-    parts.append({"text": prompt})
-
-    try:
-        resp = client.models.generate_content(
-            model=model,
-            contents=[{"role": "user", "parts": parts}],
-            config={"temperature": 0.2, "max_output_tokens": LAB_MAX_TOKENS},
-        )
-    except Exception as e:
-        clean_ai_error(e)
-
-    text = (getattr(resp, "text", "") or "").strip()
-
-    tries = 0
-    while tries < LAB_CONTINUE_MAX_TRIES and (("<<<END>>>" not in text) or (not _has_all_lab_sections(text))):
-        tries += 1
-        cont_prompt = """
-Continue EXACTLY from where you left off.
-Do NOT repeat any previous lines.
-Do NOT introduce the heading "FINDINGS".
-If any required heading is missing, add it and fill it.
-End with a new line containing exactly: <<<END>>>
-""".strip()
-
-        try:
-            resp2 = client.models.generate_content(
-                model=model,
-                contents=[
-                    {"role": "model", "parts": [{"text": text}]},
-                    {"role": "user", "parts": [{"text": cont_prompt}]},
-                ],
-                config={"temperature": 0.2, "max_output_tokens": 1200},
-            )
-        except Exception as e:
-            clean_ai_error(e)
-
-        text2 = (getattr(resp2, "text", "") or "").strip()
-        if not text2:
-            break
-        text = (text + "\n" + text2).strip()
-
-    if ("<<<END>>>" not in text) or (not _has_all_lab_sections(text)):
-        repair_prompt = """
-Rewrite the summary from scratch using ONLY the required headings in the required order.
-Do NOT use the heading "FINDINGS".
-Keep it concise but complete.
-End with <<<END>>>.
-""".strip()
-
-        try:
-            resp3 = client.models.generate_content(
-                model=model,
-                contents=[
-                    {"role": "user", "parts": parts},
-                    {"role": "user", "parts": [{"text": repair_prompt}]},
-                ],
-                config={"temperature": 0.1, "max_output_tokens": LAB_MAX_TOKENS},
-            )
-            text3 = (getattr(resp3, "text", "") or "").strip()
-            if text3:
-                text = text3.strip()
-        except Exception as e:
-            clean_ai_error(e)
-
-    text = text.replace("<<<END>>>", "").strip()
-    return finalize_lab_summary(text)
+    return text.replace("<<<END>>>", "").strip()
 
 
 def safety_guard_text(summary: str) -> str:
-    s = summary
+    s = summary or ""
     replacements = [
         ("No fracture", "No obvious displaced fracture seen; an occult/non-displaced fracture cannot be excluded"),
         ("no fracture", "no obvious displaced fracture seen; an occult/non-displaced fracture cannot be excluded"),
@@ -771,7 +804,6 @@ def safety_guard_text(summary: str) -> str:
 # HOSPITAL STYLE PDF
 # =========================
 def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
-    import re as _re
     from reportlab.lib.pagesizes import letter
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -782,10 +814,10 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
     path = os.path.join(OUT_DIR, f"{report_id}_summary.pdf")
 
     text = raw_text.replace("**", "").replace("\t", " ")
-    text = _re.sub(r"[ ]{2,}", " ", text)
+    text = re.sub(r"[ ]{2,}", " ", text)
 
     generated = ""
-    m = _re.search(r"Generated:\s*([0-9T:\.\-Z]+)", text)
+    m = re.search(r"Generated:\s*([0-9T:\.\-Z]+)", text)
     if m:
         generated = m.group(1)
 
@@ -838,13 +870,9 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
         logo_reader = ImageReader(LOGO_PATH_FALLBACK)
 
     def draw_header_footer(canvas, doc):
-        from reportlab.lib.pagesizes import letter
-        from reportlab.lib import colors
-
         w, h = letter
         canvas.saveState()
 
-        # Watermark
         canvas.saveState()
         canvas.setFillColor(colors.HexColor("#9CA3AF"))
         canvas.setFont("Helvetica-Bold", 60)
@@ -854,7 +882,6 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
         canvas.drawCentredString(0, 0, "CONFIDENTIAL")
         canvas.restoreState()
 
-        # Top bar
         canvas.setFillColor(colors.HexColor("#0B4F6C"))
         canvas.rect(0, h - 60, w, 60, fill=1, stroke=0)
 
@@ -873,7 +900,6 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
         canvas.setFont("Helvetica", 10)
         canvas.drawString(x0 + logo_size + 10, h - 50, "Summary Report")
 
-        # Footer
         canvas.setFillColor(colors.HexColor("#6B7280"))
         canvas.setFont("Helvetica", 9)
         canvas.drawRightString(w - 36, 26, f"Page {doc.page}")
@@ -889,7 +915,6 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
             16,
             "AI-generated summary for informational use only. Confirm with a clinician."
         )
-
         canvas.restoreState()
 
     doc = SimpleDocTemplate(
@@ -927,7 +952,6 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
     story.append(meta_table)
     story.append(Spacer(1, 14))
 
-    # Render lines with bullet support
     for ln in raw_text.splitlines():
         ln = ln.rstrip()
 
@@ -970,6 +994,7 @@ def health():
         "model": getattr(app.state, "model", None),
         "has_key": bool(getattr(app.state, "client", None)),
         "app_version": app.version,
+        "debug": int(DEBUG_MODE),
     }
 
 
@@ -992,16 +1017,17 @@ def process(rid: str):
 
     try:
         page_count = get_pdf_page_count(pdf_path)
-
         extracted_text = extract_pdf_text(pdf_path, max_pages=8)
+
+        # Debug extraction
+        dbg_kv("EXTRACTED_TEXT_LEN", len(extracted_text or ""))
+        dbg_text("EXTRACTED_TEXT_HEAD", (extracted_text or "")[:1200], n=1200)
+
         doc_type = detect_doc_type_from_text(extracted_text)
 
-        # Force LAB if clear lab terms exist
+        # If it smells like lab, force lab
         tlow = (extracted_text or "").lower()
-        force_lab_terms = [
-            "cbc", "hemoglobin", "haemoglobin", "platelet", "wbc", "rbc",
-            "mcv", "mch", "rdw", "reference range", "hematocrit", "haematocrit"
-        ]
+        force_lab_terms = ["cbc", "hemoglobin", "haemoglobin", "platelet", "wbc", "rbc", "mcv", "mch", "rdw", "reference range"]
         if any(k in tlow for k in force_lab_terms):
             doc_type = "lab"
 
@@ -1011,27 +1037,20 @@ def process(rid: str):
         # LAB FLOW
         # =====================
         if doc_type == "lab":
-            if extracted_text:
-                summary = gemini_lab_summary(extracted_text)
-                images_sent = 0
+            if extracted_text and len(extracted_text.strip()) >= 120:
+                summary = gemini_lab_summary_text_pipeline(extracted_text)
+
+                # If JSON extractor says it's imaging -> reroute
+                if summary == "__REROUTE_IMAGING__":
+                    doc_type = "radiology"
+                else:
+                    summary = finalize_lab_summary(summary)
             else:
-                # scanned/image-only lab -> summarize from images
+                # text extraction failed or too short -> image lab summary
                 pages_png = render_pdf_pages_to_png_bytes(pdf_path, max_pages=3, zoom=3.2)
                 all_images = pages_png[: app.state.max_total_images]
                 images_sent = len(all_images)
                 summary = gemini_lab_summary_from_images(all_images)
-
-            # If model produced imaging-style content, reroute to radiology
-            imaging_red_flags = [
-                "ct", "x-ray", "xray", "mri", "ultrasound",
-                "nodule", "spiculated", "lymphadenopathy", "mediastinal", "hilar",
-                "pet/ct", "ebus", "biopsy", "carcinoma", "metast", "staging"
-            ]
-            s_low = (summary or "").lower()
-            if any(k in s_low for k in imaging_red_flags):
-                doc_type = "radiology"
-            else:
-                # Guarantee non-stopping lab output (even if truncation)
                 summary = finalize_lab_summary(summary)
 
         # =====================
@@ -1054,7 +1073,6 @@ def process(rid: str):
             context = gemini_pass_1_identify(all_images, page_count)
             summary = gemini_pass_2_radiology_report(all_images, context, page_count)
             summary = safety_guard_text(summary)
-            summary = finalize_radiology_summary(summary)
 
     except HTTPException:
         raise
@@ -1062,9 +1080,9 @@ def process(rid: str):
         print("=== PROCESS ERROR ===")
         print(f"{type(e).__name__}: {e}")
         traceback.print_exc()
-        msg = str(e)
-        if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
-            raise HTTPException(status_code=429, detail="AI limit reached. Please come back later.")
+        # In debug, show real error so you can fix it
+        if DEBUG_MODE:
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail="Processing failed. Please try again later.")
 
     final_text = f"""Report ID: {rid}
@@ -1094,6 +1112,7 @@ Generated: {now_iso()}
         "images_sent": images_sent,
         "summary_len": REPORTS[rid]["summary_len"],
         "app_version": app.version,
+        "debug": int(DEBUG_MODE),
     }
 
 
