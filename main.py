@@ -18,7 +18,7 @@ import io
 # =========================
 # APP SETUP
 # =========================
-app = FastAPI(title="MedDecode AI", version="17.0")
+app = FastAPI(title="MedDecode AI", version="19.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,10 +53,15 @@ LOGO_PATH_FALLBACK = os.path.join(BASE_DIR, "logo.png")
 # =========================
 PASS1_MAX_TOKENS = 260
 PASS2_MAX_TOKENS = 5000
-LAB_MAX_TOKENS = 5000
+
+# LAB: smaller outputs are more reliable (avoid truncation)
+LAB_MAX_TOKENS = 2000
 
 LAB_CONTINUE_MAX_TRIES = 6
 RAD_CONTINUE_MAX_TRIES = 3
+
+# Lab text slice to reduce prompt bloat
+LAB_TEXT_SLICE = 7000
 
 
 # =========================
@@ -74,7 +79,7 @@ def startup():
     # PowerShell: $env:GEMINI_MODEL="gemini-2.5-pro"
     app.state.model = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
-    # Render knobs for radiology PDFs
+    # Radiology render knobs
     app.state.max_pages = int(os.getenv("MD_MAX_PAGES", "3"))
     app.state.render_zoom = float(os.getenv("MD_RENDER_ZOOM", "3.8"))
     app.state.max_total_images = int(os.getenv("MD_MAX_IMAGES", "10"))
@@ -136,7 +141,7 @@ def render_pdf_pages_to_png_bytes(pdf_path: str, max_pages: int, zoom: float) ->
 def extract_pdf_text(pdf_path: str, max_pages: int = 8) -> str:
     """
     Lab reports usually contain selectable text.
-    If scanned image-only PDF, this may return empty (OCR would be needed).
+    Scanned PDFs may return empty (OCR needed).
     """
     doc = fitz.open(pdf_path)
     pages = min(doc.page_count, max_pages)
@@ -149,7 +154,6 @@ def extract_pdf_text(pdf_path: str, max_pages: int = 8) -> str:
     return "\n\n".join(chunks).strip()
 
 
-# strong LAB detection
 def detect_doc_type_from_text(extracted_text: str) -> str:
     """
     Returns: "lab" or "radiology"
@@ -157,7 +161,7 @@ def detect_doc_type_from_text(extracted_text: str) -> str:
     """
     t = (extracted_text or "").lower().strip()
 
-    # If there's basically no extracted text, it's probably image-only (often radiology scans)
+    # If there's basically no extracted text, it's probably image-only
     if len(t) < 40:
         return "radiology"
 
@@ -168,7 +172,7 @@ def detect_doc_type_from_text(extracted_text: str) -> str:
         "reference range", "units", "pathology", "laboratory", "specimen", "method",
         "anisocytosis", "poikilocytosis", "peripheral smear", "megathrombocyte",
         "ferritin", "iron", "tibc", "creatinine", "alt", "ast", "bilirubin", "glucose", "hba1c",
-        "reporting laboratory", "result", "results", "flag", "high", "low",
+        "result", "results", "flag", "high", "low",
     ]
 
     rad_keywords = [
@@ -180,10 +184,9 @@ def detect_doc_type_from_text(extracted_text: str) -> str:
     lab_hits = sum(1 for k in lab_keywords if k in t)
     rad_hits = sum(1 for k in rad_keywords if k in t)
 
-    # Strong LAB bias: any lab signal in extracted text -> LAB (unless radiology is clearly stronger)
+    # Strong LAB bias
     if lab_hits >= 1 and lab_hits >= rad_hits:
         return "lab"
-
     return "radiology"
 
 
@@ -206,7 +209,7 @@ def pil_to_png_bytes(img: Image.Image) -> bytes:
 
 def make_crops_from_page(png_bytes: bytes) -> List[bytes]:
     """
-    Full image + several crops. Good for subtle fractures.
+    Full image + crops (radiology).
     """
     img = png_bytes_to_pil(png_bytes)
     w, h = img.size
@@ -263,8 +266,53 @@ def _has_all_lab_sections(text: str) -> bool:
     return all(r in t for r in required)
 
 
+def ensure_lab_complete(text: str) -> str:
+    """
+    Guarantees all required LAB headings exist.
+    If Gemini truncates, append missing sections with safe placeholders.
+    This prevents PDFs from ending mid-summary.
+    """
+    t = (text or "").strip()
+    upper = t.upper()
+
+    required_order = [
+        "IMPRESSION:",
+        "KEY ABNORMALITIES:",
+        "WHAT THIS MAY SUGGEST:",
+        "WHAT TO CONFIRM:",
+        "NEXT STEPS:",
+        "LIMITATIONS:",
+    ]
+    missing = [h for h in required_order if h not in upper]
+    if not missing:
+        return t
+
+    # If it ended mid-word, add newline
+    if t and not t.endswith((".", "!", "?", ":", "•")):
+        t += "\n"
+
+    blocks: List[str] = []
+    if "KEY ABNORMALITIES:" in missing:
+        blocks.append("KEY ABNORMALITIES:\n• Not shown (model output truncated before listing values).")
+    if "WHAT THIS MAY SUGGEST:" in missing:
+        blocks.append("WHAT THIS MAY SUGGEST:\nNot shown (model output truncated).")
+    if "WHAT TO CONFIRM:" in missing:
+        blocks.append("WHAT TO CONFIRM:\n• Not shown (model output truncated).")
+    if "NEXT STEPS:" in missing:
+        blocks.append("NEXT STEPS:\n• Not shown (model output truncated).")
+    if "LIMITATIONS:" in missing:
+        blocks.append(
+            "LIMITATIONS:\n"
+            "• Output truncated; verify using the original lab report.\n"
+            "• Reference ranges vary by lab.\n"
+            "• Clinical correlation required."
+        )
+
+    return (t + "\n\n" + "\n\n".join(blocks)).strip()
+
+
 # =========================
-# GEMINI - RADIOLOGY (PROMPTS UNCHANGED)
+# GEMINI - RADIOLOGY
 # =========================
 def gemini_pass_1_identify(all_images: List[bytes], page_count: int) -> str:
     require_client()
@@ -290,7 +338,7 @@ Body part/anatomy: ...
 Laterality: left/right/uncertain
 View/plane: ...
 Limitations: ...
-"""
+""".strip()
 
     parts = [_img_part_from_png(p) for p in all_images[: app.state.max_total_images]]
     parts.append({"text": prompt})
@@ -381,9 +429,8 @@ End your response with a new line containing exactly: <<<END>>>
         cont_prompt = """
 Continue EXACTLY from where you left off.
 Do NOT repeat anything already written.
-Finish any cut-off word/sentence and ensure all required headings exist:
-IMPRESSION, Confidence, FINDINGS, WHAT THIS MEANS, LIMITATIONS, RECOMMENDED NEXT STEP.
-End with a new line containing exactly: <<<END>>>
+Finish any cut-off word/sentence and ensure all required headings exist.
+End with <<<END>>> on its own line.
 """.strip()
 
         try:
@@ -411,16 +458,14 @@ End with a new line containing exactly: <<<END>>>
 
 
 # =========================
-# GEMINI - LAB (FIXED: ALWAYS FULL)
+# GEMINI - LAB (TEXT) - FIXED
 # =========================
 def gemini_lab_summary(extracted_text: str) -> str:
     require_client()
     client = app.state.client
     model = app.state.model
 
-    # Reduce prompt bloat (biggest reason for truncation)
-    lab_text = (extracted_text or "").strip()
-    lab_text = lab_text[:7000]  # was 14000
+    lab_text = (extracted_text or "").strip()[:LAB_TEXT_SLICE]
 
     base_prompt = f"""
 You are a clinical LAB report summarizer.
@@ -464,14 +509,14 @@ LAB REPORT TEXT:
         resp = client.models.generate_content(
             model=model,
             contents=[{"role": "user", "parts": [{"text": base_prompt}]}],
-            config={"temperature": 0.2, "max_output_tokens": 2000},
+            config={"temperature": 0.2, "max_output_tokens": LAB_MAX_TOKENS},
         )
     except Exception as e:
         clean_ai_error(e)
 
     text = (getattr(resp, "text", "") or "").strip()
 
-    # Continue WITHOUT re-sending the full lab report text (critical)
+    # Continue WITHOUT re-sending the big lab report text (critical)
     tries = 0
     while tries < LAB_CONTINUE_MAX_TRIES and (("<<<END>>>" not in text) or (not _has_all_lab_sections(text))):
         tries += 1
@@ -525,7 +570,7 @@ End with <<<END>>>.
                     {"role": "user", "parts": [{"text": repair_prompt}]},
                     {"role": "user", "parts": [{"text": "LAB REPORT TEXT:\n" + lab_text}]},
                 ],
-                config={"temperature": 0.1, "max_output_tokens": 2000},
+                config={"temperature": 0.1, "max_output_tokens": LAB_MAX_TOKENS},
             )
             text3 = (getattr(resp3, "text", "") or "").strip()
             if text3:
@@ -534,12 +579,129 @@ End with <<<END>>>.
             clean_ai_error(e)
 
     text = text.replace("<<<END>>>", "").strip()
-
-    # Safety: if model leaks FINDINGS, normalize it
     text = text.replace("FINDINGS:", "KEY ABNORMALITIES:")
+    text = ensure_lab_complete(text)
 
     if not text:
         raise RuntimeError("Gemini lab summary returned empty response.")
+    return text
+
+
+# =========================
+# GEMINI - LAB (IMAGE FALLBACK for scanned PDFs) - FIXED
+# =========================
+def gemini_lab_summary_from_images(all_images: List[bytes]) -> str:
+    require_client()
+    client = app.state.client
+    model = app.state.model
+
+    prompt = """
+You are a clinical LAB report summarizer.
+
+You will be shown images of a lab report (CBC/biochem panels).
+Goal: Produce a patient-friendly but clinically useful summary.
+
+STRICT RULES:
+- Do NOT invent values not present.
+- If a value/unit/range is not readable, write "not shown".
+- Do NOT use the heading "FINDINGS" (radiology-only).
+- Use ONLY the headings listed below, exactly and in this order.
+- Do NOT stop mid-sentence or mid-bullet.
+- End your response with a new line containing exactly: <<<END>>>
+
+OUTPUT FORMAT (exact headings, in this exact order):
+
+IMPRESSION:
+<1–3 lines. Overall pattern (possible/suggestive, not definitive).>
+
+KEY ABNORMALITIES:
+• <3–12 bullets. Each bullet: test name + value + unit + flag if visible; otherwise "not shown".>
+
+WHAT THIS MAY SUGGEST:
+<2–6 short lines (not definitive).>
+
+WHAT TO CONFIRM:
+• <2–6 bullets>
+
+NEXT STEPS:
+• <2–6 bullets>
+
+LIMITATIONS:
+• <1–4 bullets>
+""".strip()
+
+    parts = [_img_part_from_png(p) for p in all_images[: app.state.max_total_images]]
+    parts.append({"text": prompt})
+
+    try:
+        resp = client.models.generate_content(
+            model=model,
+            contents=[{"role": "user", "parts": parts}],
+            config={"temperature": 0.2, "max_output_tokens": LAB_MAX_TOKENS},
+        )
+    except Exception as e:
+        clean_ai_error(e)
+
+    text = (getattr(resp, "text", "") or "").strip()
+
+    tries = 0
+    while tries < LAB_CONTINUE_MAX_TRIES and (("<<<END>>>" not in text) or (not _has_all_lab_sections(text))):
+        tries += 1
+        cont_prompt = """
+Continue EXACTLY from where you left off.
+Do NOT repeat any previous lines.
+Do NOT introduce the heading "FINDINGS".
+If any required heading is missing, add it and fill it.
+End with a new line containing exactly: <<<END>>>
+""".strip()
+
+        try:
+            resp2 = client.models.generate_content(
+                model=model,
+                contents=[
+                    {"role": "model", "parts": [{"text": text}]},
+                    {"role": "user", "parts": [{"text": cont_prompt}]},
+                ],
+                config={"temperature": 0.2, "max_output_tokens": 1200},
+            )
+        except Exception as e:
+            clean_ai_error(e)
+
+        text2 = (getattr(resp2, "text", "") or "").strip()
+        if not text2:
+            break
+        text = (text + "\n" + text2).strip()
+
+    # Hard repair for image path too
+    if ("<<<END>>>" not in text) or (not _has_all_lab_sections(text)):
+        repair_prompt = """
+Rewrite the summary from scratch using ONLY the required headings in the required order.
+Do NOT use the heading "FINDINGS".
+Keep it concise but complete.
+End with <<<END>>>.
+""".strip()
+
+        try:
+            resp3 = client.models.generate_content(
+                model=model,
+                contents=[
+                    {"role": "user", "parts": parts},
+                    {"role": "user", "parts": [{"text": repair_prompt}]},
+                ],
+                config={"temperature": 0.1, "max_output_tokens": LAB_MAX_TOKENS},
+            )
+            text3 = (getattr(resp3, "text", "") or "").strip()
+            if text3:
+                text = text3.strip()
+        except Exception as e:
+            clean_ai_error(e)
+
+    text = text.replace("<<<END>>>", "").strip()
+    text = text.replace("FINDINGS:", "KEY ABNORMALITIES:")
+    text = ensure_lab_complete(text)
+
+    if not text:
+        raise RuntimeError("Gemini lab (image) summary returned empty response.")
     return text
 
 
@@ -635,6 +797,7 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
         w, h = letter
         canvas.saveState()
 
+        # Watermark
         canvas.saveState()
         canvas.setFillColor(colors.HexColor("#9CA3AF"))
         canvas.setFont("Helvetica-Bold", 60)
@@ -644,6 +807,7 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
         canvas.drawCentredString(0, 0, "CONFIDENTIAL")
         canvas.restoreState()
 
+        # Top bar
         canvas.setFillColor(colors.HexColor("#0B4F6C"))
         canvas.rect(0, h - 60, w, 60, fill=1, stroke=0)
 
@@ -662,6 +826,7 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
         canvas.setFont("Helvetica", 10)
         canvas.drawString(x0 + logo_size + 10, h - 50, "Summary Report")
 
+        # Footer
         canvas.setFillColor(colors.HexColor("#6B7280"))
         canvas.setFont("Helvetica", 9)
         canvas.drawRightString(w - 36, 26, f"Page {doc.page}")
@@ -715,7 +880,7 @@ def create_pdf(report_id: str, raw_text: str, filename: str) -> str:
     story.append(meta_table)
     story.append(Spacer(1, 14))
 
-    # Handles "FINDINGS: • item" as well
+    # Handles "FINDINGS: • item" too
     for ln in raw_text.splitlines():
         ln = ln.rstrip()
 
@@ -783,20 +948,38 @@ def process(rid: str):
         extracted_text = extract_pdf_text(pdf_path, max_pages=8)
         doc_type = detect_doc_type_from_text(extracted_text)
 
-        # ✅ SAFETY OVERRIDE: if text clearly looks like lab, force LAB no matter what
+        # If it smells like lab, FORCE LAB
         tlow = (extracted_text or "").lower()
-        force_lab_terms = ["cbc", "hemoglobin", "haemoglobin", "platelet", "wbc", "rbc", "mcv", "mch", "rdw", "reference range"]
+        force_lab_terms = [
+            "cbc", "hemoglobin", "haemoglobin", "platelet", "wbc", "rbc",
+            "mcv", "mch", "rdw", "reference range", "hematocrit", "haematocrit"
+        ]
         if any(k in tlow for k in force_lab_terms):
             doc_type = "lab"
 
+        images_sent = 0
+
+        # =====================
+        # LAB FLOW
+        # =====================
         if doc_type == "lab":
-            if not extracted_text:
-                raise HTTPException(
-                    status_code=400,
-                    detail="This looks like a lab report, but text could not be extracted (likely scanned). Upload a text-based PDF (selectable text).",
+            if extracted_text:
+                summary = gemini_lab_summary(extracted_text)
+                images_sent = 0
+            else:
+                # scanned/image-only lab -> summarize from images
+                pages_png = render_pdf_pages_to_png_bytes(
+                    pdf_path,
+                    max_pages=3,
+                    zoom=3.2,
                 )
-            summary = gemini_lab_summary(extracted_text)
-            images_sent = 0
+                all_images = pages_png[: app.state.max_total_images]
+                images_sent = len(all_images)
+                summary = gemini_lab_summary_from_images(all_images)
+
+        # =====================
+        # RADIOLOGY FLOW
+        # =====================
         else:
             pages_png = render_pdf_pages_to_png_bytes(
                 pdf_path,
