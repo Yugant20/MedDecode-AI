@@ -558,51 +558,81 @@ def gemini_lab_summary_plain_text(extracted_text: str) -> str:
     client = app.state.client
     model = app.state.model
 
-    lab_text = (extracted_text or "").strip()[:LAB_TEXT_SLICE]
-    if not lab_text:
-        return finalize_lab_summary("")
+    # -------------------------
+    # STEP 1: Extract JSON
+    # -------------------------
+    extract_prompt = f"""
+Extract important abnormal lab findings from the following lab report.
 
-    prompt = f"""
-You are a clinical LAB report summarizer.
+Return ONLY JSON in this exact format:
 
-STRICT RULES:
-- Do NOT invent values.
-- If missing, write "not shown".
-- Use ONLY these headings, in order:
+{{
+  "impression": "...",
+  "abnormalities": ["...", "..."],
+  "suggestions": "...",
+  "confirm": ["...", "..."],
+  "next_steps": ["...", "..."],
+  "limitations": ["...", "..."]
+}}
+
+LAB REPORT:
+{extracted_text[:6000]}
+"""
+
+    resp1 = client.models.generate_content(
+        model=model,
+        contents=[{"role": "user", "parts": [{"text": extract_prompt}]}],
+        config={"temperature": 0.1, "max_output_tokens": 1200},
+    )
+
+    json_text = genai_text(resp1)
+
+    if not json_text.strip():
+        raise RuntimeError("JSON extraction failed")
+
+    # -------------------------
+    # STEP 2: Summarize JSON
+    # -------------------------
+    summary_prompt = f"""
+Convert this JSON into a clinical summary.
+
+FORMAT EXACTLY:
+
 IMPRESSION:
+...
+
 KEY ABNORMALITIES:
+• ...
+• ...
+
 WHAT THIS MAY SUGGEST:
+...
+
 WHAT TO CONFIRM:
+• ...
+
 NEXT STEPS:
+• ...
+
 LIMITATIONS:
-- End with <<<END>>>.
+• ...
 
-LAB REPORT TEXT:
-{lab_text}
-""".strip()
+JSON:
+{json_text}
+"""
 
-    try:
-        resp = client.models.generate_content(
-            model=model,
-            contents=[{"role": "user", "parts": [{"text": prompt}]}],
-            config={
-                "temperature": 0.2,
-                "max_output_tokens": LAB_SUMMARY_MAX_TOKENS,
-                "stop_sequences": ["<<<END>>>"],
-            },
-        )
-    except Exception as e:
-        clean_ai_error(e)
+    resp2 = client.models.generate_content(
+        model=model,
+        contents=[{"role": "user", "parts": [{"text": summary_prompt}]}],
+        config={"temperature": 0.2, "max_output_tokens": 1500},
+    )
 
-    text = genai_text(resp)
-    dbg_text("LAB_SUMMARY_TEXT_RAW", text)
+    final = genai_text(resp2)
 
-    # 🚨 FAIL LOUDLY if empty
-    if not text.strip():
-        raise RuntimeError("Gemini returned empty text for LAB summary (plain-text).")
+    if not final.strip():
+        raise RuntimeError("Summary generation failed")
 
-    text = (text or "").replace("<<<END>>>", "").strip()
-    return finalize_lab_summary(text)
+    return final.strip()
 
 
 def gemini_lab_summary_text_pipeline(extracted_text: str) -> str:
